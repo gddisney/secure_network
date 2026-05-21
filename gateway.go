@@ -1,15 +1,15 @@
 package secure_network
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"time"
-    "crypto/tls"
 
-	"github.com/gddisney/ultimate_db"
 	"github.com/flynn/noise"
+	"github.com/gddisney/ultimate_db"
 	"github.com/quic-go/quic-go"
 )
 
@@ -74,7 +74,6 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 	}
 
 	remoteKey := hs.PeerStatic()
-
 	if !g.isIdentityValid(remoteKey) {
 		log.Printf("[GATEWAY] Revoked key attempted connection. Dropping stream.")
 		return
@@ -85,7 +84,7 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 		log.Printf("[GATEWAY] Failed to complete handshake: %v", err)
 		return
 	}
-	
+
 	_, err = stream.Write(respMsg)
 	if err != nil {
 		return
@@ -98,12 +97,10 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 		if err != nil {
 			break
 		}
-
 		decrypted, err := csRecv.Decrypt(nil, nil, buf[:n])
 		if err != nil {
 			continue
 		}
-
 		g.routeToAPI(remoteKey, decrypted)
 	}
 }
@@ -117,21 +114,21 @@ func (g *Gateway) ScrubbingCycle() {
 	ticker := time.NewTicker(24 * time.Hour)
 	for range ticker.C {
 		log.Println("[CLEANUP] Starting global revocation scrub...")
-		
 		if g.router.GUIKit == nil {
 			continue
 		}
 
 		tree := ultimate_db.NewBTree(g.router.GUIKit.BP, 2)
 		cursor, _ := ultimate_db.NewBTreeCursor(tree)
-		
+
 		for {
 			key, val, err := cursor.Next()
 			if err != nil {
 				break
 			}
-
-			var meta struct { Signer []byte }
+			var meta struct {
+				Signer []byte
+			}
 			json.Unmarshal(val, &meta)
 
 			if len(meta.Signer) > 0 && !g.isIdentityValid(meta.Signer) {
@@ -215,6 +212,21 @@ func (g *Gateway) routeToAPI(signer []byte, payload []byte) {
 		err := g.router.DB.Write(3, txnID, []byte(shareKey), val, 0)
 		if err == nil {
 			log.Printf("[GATEWAY] Content %s shared by %x", req.Target, signer[:8])
+		}
+
+	case "rpc":
+		var rpcPayload map[string]interface{}
+		if err := json.Unmarshal([]byte(req.Content), &rpcPayload); err != nil {
+			log.Printf("[GATEWAY] Invalid RPC content from %x: %v", signer[:8], err)
+			return
+		}
+
+		rpcPayload["signer"] = signer
+
+		enrichedPayload, _ := json.Marshal(rpcPayload)
+		g.router.LocalBus <- Event{
+			Topic:   "rpc_ingress",
+			Payload: enrichedPayload,
 		}
 
 	default:
