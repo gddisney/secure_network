@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"log"
-	
+
 	"github.com/gddisney/ultimate_db"
 	"github.com/gddisney/webauthnext"
 )
@@ -22,11 +22,13 @@ func NewEdgeNode(ctx context.Context, dbPath string, staticPrivKey []byte, auth 
 	if err != nil {
 		return nil, err
 	}
+
 	bp := ultimate_db.NewBufferPool(dm, 1024)
 	wal, err := ultimate_db.NewBatchingWAL(dbPath + "_wal.log")
 	if err != nil {
 		return nil, err
 	}
+
 	db := ultimate_db.NewDB(bp, wal)
 	ultimate_db.RecoverDB(dbPath+"_wal.log", db)
 
@@ -37,6 +39,9 @@ func NewEdgeNode(ctx context.Context, dbPath string, staticPrivKey []byte, auth 
 	router, _ := NewRouter(db, nil, "secure_session_token")
 	gateway := NewGateway(router, peerMesh)
 	peerMesh.SetGateway(gateway)
+
+	rpcEngine := NewRPCManager(peerMesh)
+	router.Attach(rpcEngine)
 
 	return &EdgeNode{
 		DB:       db,
