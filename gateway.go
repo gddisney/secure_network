@@ -304,7 +304,7 @@ func (g *Gateway) routeToAPI(signer []byte, payload []byte) {
 		rpcPayload["signer"] = signer
 		enrichedPayload, _ := json.Marshal(rpcPayload)
 		
-		g.router.LocalBus <- Event{
+		g.router.LocalBus <- SystemEvent{
 			Topic:   "rpc_ingress",
 			Payload: enrichedPayload,
 		}
