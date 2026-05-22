@@ -37,7 +37,15 @@ func NewEdgeNode(ctx context.Context, dbPath string, staticPrivKey []byte, auth 
 	peerMesh.SetIngressHandler(gossip.HandleIngress)
 
 	router, _ := NewRouter(db, nil, "secure_session_token")
-	gateway := NewGateway(router, peerMesh)
+
+	// ✨ FIX: Load or generate keys to satisfy the updated NewGateway constructor
+	noisePriv, noisePub, _, err := loadOrGenerateKeys(db)
+	if err != nil {
+		return nil, err
+	}
+
+	// ✨ FIX: Passed the necessary noisePriv and noisePub byte arrays
+	gateway := NewGateway(router, peerMesh, noisePriv, noisePub)
 	peerMesh.SetGateway(gateway)
 
 	rpcEngine := NewRPCManager(peerMesh)
