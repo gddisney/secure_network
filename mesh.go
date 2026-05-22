@@ -29,7 +29,7 @@ type MeshNode struct {
 	dbscPriv  ed25519.PrivateKey
 	gatePub   []byte
 	cipher    noise.CipherSuite
-	stream    quic.Stream
+	stream    *quic.Stream // ✨ FIX: Changed to *quic.Stream pointer
 	csSend    *noise.CipherState
 	csRecv    *noise.CipherState
 }
@@ -100,7 +100,7 @@ func (m *MeshNode) Connect(gatewayAddr string) error {
 	if err != nil {
 		return fmt.Errorf("mesh stream open failed: %w", err)
 	}
-	m.stream = stream
+	m.stream = &stream // Assigned directly to the struct pointer field
 
 	hs, err := noise.NewHandshakeState(noise.Config{
 		CipherSuite:   m.cipher,
@@ -158,7 +158,7 @@ func (m *MeshNode) SendAction(payload APIPayload) error {
 		return fmt.Errorf("mesh encryption failed: %w", err)
 	}
 
-	_, err = m.stream.Write(encrypted)
+	_, err = (*m.stream).Write(encrypted)
 	return err
 }
 
@@ -166,7 +166,7 @@ func (m *MeshNode) SendAction(payload APIPayload) error {
 func (m *MeshNode) listen() {
 	buf := make([]byte, 4096)
 	for {
-		n, err := m.stream.Read(buf)
+		n, err := (*m.stream).Read(buf)
 		if err != nil {
 			log.Printf("[SECURE_MESH] Stream closed or read error: %v", err)
 			break
