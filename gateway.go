@@ -23,7 +23,7 @@ const (
 
 type Gateway struct {
 	router         *Router
-	peerMesh       *PeerRoute
+	peerMesh       *PeerRoute // Assuming this is defined elsewhere in your package
 	cipher         noise.CipherSuite
 	sPriv          []byte
 	sPub           []byte
@@ -127,11 +127,9 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 }
 
 func (g *Gateway) isIdentityValid(pubKey []byte) bool {
-	txn := g.router.DB.BeginTxn()
-	defer g.router.DB.CommitTxn(txn)
-
-	_, err := g.router.DB.Read(IdentityPageID, txn, pubKey)
-	return err == nil
+	// Let the PolicyEngine decide based on DB blacklists and explicit PBAC permissions.
+	// Requires a baseline "network:connect" permission to establish a tunnel.
+	return g.router.PolicyEngine.HasPermission(pubKey, "network:connect")
 }
 
 func (g *Gateway) monitorHeartbeat(stream quic.Stream, csSend *noise.CipherState, signer []byte, stop <-chan struct{}) {
@@ -222,6 +220,20 @@ func (g *Gateway) routeToAPI(signer []byte, payload []byte) {
 	var req APIPayload
 	if err := json.Unmarshal(payload, &req); err != nil {
 		log.Printf("[GATEWAY] Invalid API payload from %x: %v", signer[:8], err)
+		return
+	}
+
+	contextData := map[string]string{
+		"target": req.Target,
+	}
+
+	resource := req.Target
+	if resource == "" {
+		resource = "*"
+	}
+
+	if !g.router.PolicyEngine.Evaluate(signer, req.Action, resource, contextData) {
+		log.Printf("[SECURITY] Gateway blocked unauthorized action '%s' by %x", req.Action, signer[:8])
 		return
 	}
 
