@@ -21,11 +21,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gddisney/guikit"
+	"github.com/gddisney/secure_policy"
+	"github.com/gddisney/ultimate_db"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-
-	"github.com/gddisney/guikit"
-	"github.com/gddisney/ultimate_db"
 )
 
 type Module interface {
@@ -34,7 +34,6 @@ type Module interface {
 	Start() error
 }
 
-// ✨ FIX: Renamed Event to SystemEvent to prevent collision with gateway.go
 type SystemEvent struct {
 	Topic   string
 	Payload []byte
@@ -53,26 +52,31 @@ type Router struct {
 	RouteMap     map[string]string
 
 	Modules  map[string]Module
-	LocalBus chan SystemEvent // ✨ FIX: Updated channel to use SystemEvent
+	LocalBus chan SystemEvent
 
 	ActiveTunnel *quic.Conn
+
+	PolicyEngine   *secure_policy.PolicyEngine
+	SessionManager *secure_policy.SessionManager
 }
 
-func NewRouter(db *ultimate_db.DB, gk *guikit.GUIKit, targetCookie string) (*Router, error) {
+func NewRouter(db *ultimate_db.DB, gk *guikit.GUIKit, targetCookie string, pe *secure_policy.PolicyEngine, sm *secure_policy.SessionManager) (*Router, error) {
 	tlsConf, err := generateEphemeralTLS()
 	if err != nil {
 		return nil, err
 	}
 
 	return &Router{
-		TLSConfig:    tlsConf,
-		Mux:          http.NewServeMux(),
-		GUIKit:       gk,
-		DB:           db,
-		TargetCookie: targetCookie,
-		RouteMap:     make(map[string]string),
-		Modules:      make(map[string]Module),
-		LocalBus:     make(chan SystemEvent, 2048), // ✨ FIX: Updated channel initialization
+		TLSConfig:      tlsConf,
+		Mux:            http.NewServeMux(),
+		GUIKit:         gk,
+		DB:             db,
+		TargetCookie:   targetCookie,
+		RouteMap:       make(map[string]string),
+		Modules:        make(map[string]Module),
+		LocalBus:       make(chan SystemEvent, 2048),
+		PolicyEngine:   pe,
+		SessionManager: sm,
 	}, nil
 }
 
@@ -127,7 +131,7 @@ func (w *dbscInterceptor) WriteHeader(code int) {
 			break
 		}
 	}
-	
+
 	for _, cookieStr := range w.Header()["Set-Cookie"] {
 		if strings.HasPrefix(cookieStr, w.router.TargetCookie+"=") {
 			w.Header().Set("Secure-Session-Registration", `(ES256 RS256); path="/StartSession"`)
@@ -261,22 +265,28 @@ func (r *Router) proxyToTunnel(w http.ResponseWriter, req *http.Request) bool {
 	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
-	
+
 	return true
 }
 
 func (r *Router) setupDBSCRoutes() {
 	r.Mux.HandleFunc("/StartSession", func(w http.ResponseWriter, req *http.Request) {
 		yamlDomain := getDBSCDomain(r.RouteMap, req)
-		var cookieValue string
-		if c, err := req.Cookie(r.TargetCookie); err == nil {
-			cookieValue = c.Value
+		
+		// In a production scenario, you would extract the authenticated subject
+		// from prior middleware or TLS client auth here. 
+		subject := []byte("hardware_subject_placeholder")
+
+		signedToken, jti, err := r.SessionManager.IssueCookieToken(subject, 24*time.Hour)
+		if err != nil {
+			http.Error(w, "Failed to issue session token", http.StatusInternalServerError)
+			return
 		}
 
 		cookie := &http.Cookie{
 			Name:     r.TargetCookie,
-			Value:    cookieValue,
-			MaxAge:   600,
+			Value:    signedToken,
+			MaxAge:   86400,
 			Domain:   yamlDomain,
 			Secure:   true,
 			SameSite: http.SameSiteLaxMode,
@@ -288,7 +298,7 @@ func (r *Router) setupDBSCRoutes() {
 			"session_identifier": "%s",
 			"refresh_url": "/RefreshEndpoint",
 			"credentials": [{"type": "cookie", "name": "%s", "attributes": "Domain=%s; Secure; SameSite=Lax"}]
-		}`, cookieValue, r.TargetCookie, yamlDomain)
+		}`, jti, r.TargetCookie, yamlDomain)
 		w.Write([]byte(jsonResponse))
 	})
 
@@ -334,8 +344,15 @@ func (r *Router) startDualStackIngress() {
 				break
 			}
 		}
+		
 		if sessionCookie != nil {
-			req.Header.Set("X-Secure-Session-Id", sessionCookie.Value)
+			subjectID, err := r.SessionManager.ValidateCookieToken(sessionCookie.Value)
+			if err == nil {
+				req.Header.Set("X-Secure-Subject", subjectID)
+				req.Header.Set("X-Secure-Session-Id", sessionCookie.Value)
+			} else {
+				req.Header.Del("X-Secure-Session-Id")
+			}
 		}
 
 		if !r.proxyToTunnel(interceptor, req) {
