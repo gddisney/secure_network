@@ -28,7 +28,10 @@ type MeshNode struct {
 	dbscPriv  ed25519.PrivateKey
 	gatePub   []byte
 	cipher    noise.CipherSuite
-	stream    *quic.Stream // Keeping the pointer here
+	
+	// FIX: Exported with a capital 'S' and typed as the quic.Stream interface 
+	// so it can be passed directly into yamux.Server()
+	Stream    quic.Stream 
 	csSend    *noise.CipherState
 	csRecv    *noise.CipherState
 }
@@ -64,7 +67,7 @@ func loadOrGenerateKeys(db *ultimate_db.DB) ([]byte, []byte, ed25519.PrivateKey,
 
 	return kp.Private, kp.Public, dbscPriv, nil
 }
-// Add these to secure_network/mesh.go
+
 func (m *MeshNode) GetNoisePubKey() []byte {
 	return m.noisePub
 }
@@ -104,8 +107,8 @@ func (m *MeshNode) Connect(gatewayAddr string) error {
 	if err != nil {
 		return fmt.Errorf("mesh stream open failed: %w", err)
 	}
-	// ✨ FIX: Removed the '&' because OpenStreamSync already returns the pointer type we need
-	m.stream = stream
+	
+	m.Stream = stream
 
 	hs, err := noise.NewHandshakeState(noise.Config{
 		CipherSuite:   m.cipher,
@@ -124,13 +127,12 @@ func (m *MeshNode) Connect(gatewayAddr string) error {
 		return fmt.Errorf("mesh write message failed: %w", err)
 	}
 
-	// ✨ FIX: Call stream functions directly
-	if _, err = m.stream.Write(msg); err != nil {
+	if _, err = m.Stream.Write(msg); err != nil {
 		return fmt.Errorf("mesh stream write failed: %w", err)
 	}
 
 	buf := make([]byte, 4096)
-	n, err := m.stream.Read(buf)
+	n, err := m.Stream.Read(buf)
 	if err != nil {
 		return fmt.Errorf("mesh stream read failed: %w", err)
 	}
@@ -143,13 +145,19 @@ func (m *MeshNode) Connect(gatewayAddr string) error {
 	m.csRecv = csRecv
 	log.Printf("[SECURE_MESH] Overlay connected. Node PubKey: %x", m.noisePub[:8])
 
-	go m.listen()
-
+	// FIX: Do NOT automatically start `listen()` here. 
+	// If this is a Yamux tunnel, listen() will steal Yamux's traffic.
+	// Standard mesh RPC nodes will call m.StartDaemon() manually after Connect().
 	return nil
 }
 
+// StartDaemon is called by standard mesh nodes that need to listen for RPC/Heartbeats
+func (m *MeshNode) StartDaemon() {
+	go m.listen()
+}
+
 func (m *MeshNode) SendAction(payload APIPayload) error {
-	if m.csSend == nil || m.stream == nil {
+	if m.csSend == nil || m.Stream == nil {
 		return fmt.Errorf("mesh tunnel is not established")
 	}
 
@@ -163,16 +171,14 @@ func (m *MeshNode) SendAction(payload APIPayload) error {
 		return fmt.Errorf("mesh encryption failed: %w", err)
 	}
 
-	// ✨ FIX: Call stream functions directly
-	_, err = m.stream.Write(encrypted)
+	_, err = m.Stream.Write(encrypted)
 	return err
 }
 
 func (m *MeshNode) listen() {
 	buf := make([]byte, 4096)
 	for {
-		// ✨ FIX: Call stream functions directly
-		n, err := m.stream.Read(buf)
+		n, err := m.Stream.Read(buf)
 		if err != nil {
 			log.Printf("[SECURE_MESH] Stream closed or read error: %v", err)
 			break
