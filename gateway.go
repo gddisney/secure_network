@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -128,6 +127,25 @@ func (g *Gateway) HandleSecureStream(stream quic.Stream) {
 		if err != nil {
 			continue
 		}
+
+		// Catch the Tunnel Bind immediately
+		var req APIPayload
+		if err := json.Unmarshal(decrypted, &req); err == nil && req.Action == "tunnel_bind" {
+			if mod, exists := g.router.Modules["mesh_tunnel"]; exists {
+				tunnelManager := mod.(*TunnelManager)
+
+				// We pass the parent QUIC connection directly to the TunnelManager
+				// so it can open multiplexed HTTP streams.
+				if err := tunnelManager.RegisterTunnel(stream.Connection(), []byte(req.Content)); err != nil {
+					stream.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
+				}
+				
+				// Exit the standard gateway loop. The TunnelManager now owns this connection.
+				return
+			}
+		}
+
+		// Fallback to standard API routing
 		g.routeToAPI(remoteKey, decrypted)
 	}
 
