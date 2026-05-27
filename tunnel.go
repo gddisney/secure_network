@@ -196,6 +196,18 @@ func (t *TunnelManager) listenPublicHTTP() {
 	http.ListenAndServe(":"+t.PublicPort, proxy)
 }
 
+// TunnelAgentConfig defines connection parameters for the client side.
+type TunnelAgentConfig struct {
+	GatewayAddr  string
+	LocalAddr    string
+	Subdomain    string
+	IdentityType string
+	Identifier   string
+	SessionToken string
+	Signer       func(payload string) (string, error)
+}
+
+// RunMeshTunnelAgent connects the local application to the Aura Microkernel.
 func RunMeshTunnelAgent(ctx context.Context, cfg TunnelAgentConfig, tlsConfig *tls.Config) error {
 	tlsConfig.NextProtos = []string{"secure-overlay"}
 	for {
@@ -228,16 +240,6 @@ func RunMeshTunnelAgent(ctx context.Context, cfg TunnelAgentConfig, tlsConfig *t
 	}
 }
 
-type TunnelAgentConfig struct {
-	GatewayAddr  string
-	LocalAddr    string
-	Subdomain    string
-	IdentityType string
-	Identifier   string
-	SessionToken string
-	Signer       func(payload string) (string, error)
-}
-
 func proxyStreamToLocal(stream quic.Stream, localAddr string) {
 	defer stream.Close()
 	local, err := net.Dial("tcp", localAddr)
@@ -246,7 +248,7 @@ func proxyStreamToLocal(stream quic.Stream, localAddr string) {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	// Cast stream to interface for io.Copy compatibility
+	// Cast stream to io interfaces to force satisfaction
 	go func() { defer wg.Done(); io.Copy(local, stream.(io.Reader)) }()
 	go func() { defer wg.Done(); io.Copy(stream.(io.Writer), local) }()
 	wg.Wait()
