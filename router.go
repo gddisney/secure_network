@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/gddisney/guikit"
+	"github.com/gddisney/logger"
 	"github.com/gddisney/secure_policy"
 	"github.com/gddisney/ultimate_db"
 	"github.com/quic-go/quic-go"
@@ -58,9 +59,10 @@ type Router struct {
 
 	PolicyEngine   *secure_policy.PolicyEngine
 	SessionManager *secure_policy.SessionManager
+	Logger         *logger.LogDispatcher // Injected Logger
 }
 
-func NewRouter(db *ultimate_db.DB, gk *guikit.GUIKit, targetCookie string, pe *secure_policy.PolicyEngine, sm *secure_policy.SessionManager) (*Router, error) {
+func NewRouter(db *ultimate_db.DB, gk *guikit.GUIKit, targetCookie string, pe *secure_policy.PolicyEngine, sm *secure_policy.SessionManager, sysLog *logger.LogDispatcher) (*Router, error) {
 	tlsConf, err := generateEphemeralTLS()
 	if err != nil {
 		return nil, err
@@ -77,6 +79,7 @@ func NewRouter(db *ultimate_db.DB, gk *guikit.GUIKit, targetCookie string, pe *s
 		LocalBus:       make(chan SystemEvent, 2048),
 		PolicyEngine:   pe,
 		SessionManager: sm,
+		Logger:         sysLog,
 	}, nil
 }
 
@@ -87,16 +90,21 @@ func (r *Router) Attach(mod Module) {
 }
 
 func (r *Router) Boot() {
-	log.Println("[AURA] Booting Microkernel...")
+	if r.Logger != nil {
+		r.Logger.Info("Booting Aura Microkernel...")
+	} else {
+		log.Println("[AURA] Booting Microkernel...")
+	}
 
 	for name, mod := range r.Modules {
 		if err := mod.Init(r); err != nil {
+			if r.Logger != nil { r.Logger.Error(fmt.Sprintf("Kernel Panic: Module '%s' failed to init: %v", name, err)) }
 			log.Fatalf("[AURA] Kernel Panic: Module '%s' failed to init: %v", name, err)
 		}
 		go func(m Module, n string) {
-			log.Printf("[AURA] Starting daemon: %s", n)
+			if r.Logger != nil { r.Logger.Info("Starting daemon: " + n) }
 			if err := m.Start(); err != nil {
-				log.Printf("[AURA] Module '%s' crashed: %v", n, err)
+				if r.Logger != nil { r.Logger.Error(fmt.Sprintf("Module '%s' crashed: %v", n, err)) }
 			}
 		}(mod, name)
 	}
@@ -127,7 +135,10 @@ func (w *dbscInterceptor) WriteHeader(code int) {
 		if cookie.Name == w.router.TargetCookie {
 			yamlDomain := getDBSCDomain(w.router.RouteMap, w.req)
 			w.Header().Set("Secure-Session-Registration", `(ES256 RS256); path="/StartSession"`)
-			log.Printf("[DBSC] Injected Secure-Session-Registration for %s (Domain: %s)", cookie.Name, yamlDomain)
+			
+			if w.router.Logger != nil {
+				w.router.Logger.Debug(fmt.Sprintf("Injected Secure-Session-Registration for %s (Domain: %s)", cookie.Name, yamlDomain))
+			}
 			break
 		}
 	}
@@ -163,10 +174,13 @@ func (r *Router) startQUICTunnel() {
 		KeepAlivePeriod: 30 * time.Second,
 	})
 	if err != nil {
+		if r.Logger != nil { r.Logger.Error(fmt.Sprintf("Failed to bind QUIC Tunnel backplane: %v", err)) }
 		log.Fatalf("[AURA] Failed to bind QUIC Tunnel backplane: %v", err)
 	}
 
-	log.Printf("[TUNNEL] QUIC Backplane active on UDP :%s", tunnelPort)
+	if r.Logger != nil {
+		r.Logger.Info(fmt.Sprintf("QUIC Backplane active on UDP :%s", tunnelPort))
+	}
 
 	for {
 		conn, err := listener.Accept(context.Background())
@@ -174,7 +188,9 @@ func (r *Router) startQUICTunnel() {
 			continue
 		}
 
-		log.Printf("[TUNNEL] Secure QUIC connection established from %s", conn.RemoteAddr())
+		if r.Logger != nil {
+			r.Logger.Info(fmt.Sprintf("Secure QUIC connection established from %s", conn.RemoteAddr()))
+		}
 
 		r.mu.Lock()
 		if r.ActiveTunnel != nil {
@@ -196,7 +212,7 @@ func (r *Router) proxyToTunnel(w http.ResponseWriter, req *http.Request) bool {
 
 	stream, err := tunnel.OpenStreamSync(context.Background())
 	if err != nil {
-		log.Printf("[TUNNEL] Failed to open QUIC stream: %v", err)
+		if r.Logger != nil { r.Logger.Error(fmt.Sprintf("Failed to open QUIC stream: %v", err)) }
 		return false
 	}
 
@@ -293,6 +309,10 @@ func (r *Router) setupDBSCRoutes() {
 		}
 		http.SetCookie(w, cookie)
 
+		if r.Logger != nil {
+			r.Logger.Audit("system", "DBSC_SESSION_ISSUED", fmt.Sprintf("Issued new hardware-bound session on domain: %s", yamlDomain))
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		jsonResponse := fmt.Sprintf(`{
 			"session_identifier": "%s",
@@ -310,6 +330,8 @@ func (r *Router) setupDBSCRoutes() {
 		if req.Header.Get("Secure-Session-Response") == "" {
 			w.Header().Set("Secure-Session-Challenge", `"challenge_value_12345"`)
 			w.WriteHeader(http.StatusForbidden)
+			
+			if r.Logger != nil { r.Logger.Audit("system", "DBSC_REFRESH_DENIED", "Missing Secure-Session-Response header") }
 			return
 		}
 
@@ -382,12 +404,12 @@ func (r *Router) startDualStackIngress() {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		log.Printf("[INGRESS] HTTP/3 (UDP) edge listening on :%s", r.Port)
+		if r.Logger != nil { r.Logger.Info(fmt.Sprintf("HTTP/3 (UDP) edge listening on :%s", r.Port)) }
 		h3Server.ListenAndServe()
 	}()
 	go func() {
 		defer wg.Done()
-		log.Printf("[INGRESS] HTTPS (TCP) fallback listening on :%s", r.Port)
+		if r.Logger != nil { r.Logger.Info(fmt.Sprintf("HTTPS (TCP) fallback listening on :%s", r.Port)) }
 		tcpServer.ListenAndServeTLS("", "")
 	}()
 	wg.Wait()
