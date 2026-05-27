@@ -8,10 +8,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/flynn/noise"
+	"github.com/gddisney/logger"
 	"github.com/gddisney/ultimate_db"
 	"github.com/quic-go/quic-go"
 )
@@ -28,12 +28,13 @@ type MeshNode struct {
 	dbscPriv  ed25519.PrivateKey
 	gatePub   []byte
 	cipher    noise.CipherSuite
-	stream    *quic.Stream // Keeping the pointer here
+	stream    *quic.Stream
 	csSend    *noise.CipherState
 	csRecv    *noise.CipherState
+	Logger    *logger.LogDispatcher // Injected Logger
 }
 
-func loadOrGenerateKeys(db *ultimate_db.DB) ([]byte, []byte, ed25519.PrivateKey, error) {
+func loadOrGenerateKeys(db *ultimate_db.DB, sysLog *logger.LogDispatcher) ([]byte, []byte, ed25519.PrivateKey, error) {
 	txn := db.BeginTxn()
 	defer db.CommitTxn(txn)
 
@@ -45,7 +46,9 @@ func loadOrGenerateKeys(db *ultimate_db.DB) ([]byte, []byte, ed25519.PrivateKey,
 		return noisePriv, noisePub, ed25519.PrivateKey(dbscPrivRaw), nil
 	}
 
-	log.Println("[SECURE_MESH] No local identity found. Generating new node keys...")
+	if sysLog != nil {
+		sysLog.Info("No local identity found. Generating new node keys...")
+	}
 
 	cipher := noise.NewCipherSuite(noise.DH25519, noise.CipherAESGCM, noise.HashSHA256)
 	kp, err := cipher.GenerateKeypair(rand.Reader)
@@ -64,7 +67,7 @@ func loadOrGenerateKeys(db *ultimate_db.DB) ([]byte, []byte, ed25519.PrivateKey,
 
 	return kp.Private, kp.Public, dbscPriv, nil
 }
-// Add these to secure_network/mesh.go
+
 func (m *MeshNode) GetNoisePubKey() []byte {
 	return m.noisePub
 }
@@ -73,8 +76,8 @@ func (m *MeshNode) GetDBSCPrivKey() ed25519.PrivateKey {
 	return m.dbscPriv
 }
 
-func NewMeshNode(db *ultimate_db.DB, gatePub []byte) (*MeshNode, error) {
-	nPriv, nPub, dPriv, err := loadOrGenerateKeys(db)
+func NewMeshNode(db *ultimate_db.DB, gatePub []byte, sysLog *logger.LogDispatcher) (*MeshNode, error) {
+	nPriv, nPub, dPriv, err := loadOrGenerateKeys(db, sysLog)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init local keys: %w", err)
 	}
@@ -86,6 +89,7 @@ func NewMeshNode(db *ultimate_db.DB, gatePub []byte) (*MeshNode, error) {
 		dbscPriv:  dPriv,
 		gatePub:   gatePub,
 		cipher:    noise.NewCipherSuite(noise.DH25519, noise.CipherAESGCM, noise.HashSHA256),
+		Logger:    sysLog,
 	}, nil
 }
 
@@ -104,7 +108,6 @@ func (m *MeshNode) Connect(gatewayAddr string) error {
 	if err != nil {
 		return fmt.Errorf("mesh stream open failed: %w", err)
 	}
-	// ✨ FIX: Removed the '&' because OpenStreamSync already returns the pointer type we need
 	m.stream = stream
 
 	hs, err := noise.NewHandshakeState(noise.Config{
@@ -124,7 +127,6 @@ func (m *MeshNode) Connect(gatewayAddr string) error {
 		return fmt.Errorf("mesh write message failed: %w", err)
 	}
 
-	// ✨ FIX: Call stream functions directly
 	if _, err = m.stream.Write(msg); err != nil {
 		return fmt.Errorf("mesh stream write failed: %w", err)
 	}
@@ -141,7 +143,10 @@ func (m *MeshNode) Connect(gatewayAddr string) error {
 
 	m.csSend = csSend
 	m.csRecv = csRecv
-	log.Printf("[SECURE_MESH] Overlay connected. Node PubKey: %x", m.noisePub[:8])
+	
+	if m.Logger != nil {
+		m.Logger.Info(fmt.Sprintf("Overlay connected. Node PubKey: %x", m.noisePub[:8]))
+	}
 
 	go m.listen()
 
@@ -163,7 +168,6 @@ func (m *MeshNode) SendAction(payload APIPayload) error {
 		return fmt.Errorf("mesh encryption failed: %w", err)
 	}
 
-	// ✨ FIX: Call stream functions directly
 	_, err = m.stream.Write(encrypted)
 	return err
 }
@@ -171,16 +175,15 @@ func (m *MeshNode) SendAction(payload APIPayload) error {
 func (m *MeshNode) listen() {
 	buf := make([]byte, 4096)
 	for {
-		// ✨ FIX: Call stream functions directly
 		n, err := m.stream.Read(buf)
 		if err != nil {
-			log.Printf("[SECURE_MESH] Stream closed or read error: %v", err)
+			if m.Logger != nil { m.Logger.Error(fmt.Sprintf("Stream closed or read error: %v", err)) }
 			break
 		}
 
 		decrypted, err := m.csRecv.Decrypt(nil, nil, buf[:n])
 		if err != nil {
-			log.Printf("[SECURE_MESH] Decryption failed on incoming message: %v", err)
+			if m.Logger != nil { m.Logger.Error(fmt.Sprintf("Decryption failed on incoming message: %v", err)) }
 			continue
 		}
 
@@ -192,7 +195,6 @@ func (m *MeshNode) listen() {
 		if req.Action == "dbsc_heartbeat_req" {
 			challenge := []byte(req.Content)
 			signature := ed25519.Sign(m.dbscPriv, challenge)
-			
 			encodedSig := base64.StdEncoding.EncodeToString(signature)
 
 			m.SendAction(APIPayload{
@@ -203,15 +205,15 @@ func (m *MeshNode) listen() {
 		}
 
 		txnID := m.db.BeginTxn()
-		taskID := fmt.Sprintf("task:%d", time.Now().UnixNano()) 
-		
+		taskID := fmt.Sprintf("task:%d", time.Now().UnixNano())
+
 		err = m.db.Write(TaskPageID, txnID, []byte(taskID), decrypted, 0)
 		m.db.CommitTxn(txnID)
 
 		if err != nil {
-			log.Printf("[SECURE_MESH] Failed to persist task %s: %v", taskID, err)
+			if m.Logger != nil { m.Logger.Error(fmt.Sprintf("Failed to persist task %s: %v", taskID, err)) }
 		} else {
-			log.Printf("[SECURE_MESH] Ingress task written to DB. Action: %s", req.Action)
+			if m.Logger != nil { m.Logger.Info(fmt.Sprintf("Ingress task written to DB. Action: %s", req.Action)) }
 		}
 	}
 }
