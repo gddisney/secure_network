@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
+	"net"
 	"testing"
 	"time"
 
@@ -17,13 +18,25 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-type mockQUICConn struct{}
+type mockQUICConn struct {
+	ctx context.Context
+}
 
-func (m *mockQUICConn) AcceptStream(context.Context) (*quic.Stream, error) {
+func newMockQUICConn() *mockQUICConn {
+	return &mockQUICConn{
+		ctx: context.Background(),
+	}
+}
+
+func (m *mockQUICConn) AcceptStream(
+	ctx context.Context,
+) (*quic.Stream, error) {
 	return nil, nil
 }
 
-func (m *mockQUICConn) AcceptUniStream(context.Context) (*quic.ReceiveStream, error) {
+func (m *mockQUICConn) AcceptUniStream(
+	ctx context.Context,
+) (*quic.ReceiveStream, error) {
 	return nil, nil
 }
 
@@ -31,7 +44,9 @@ func (m *mockQUICConn) OpenStream() (*quic.Stream, error) {
 	return nil, nil
 }
 
-func (m *mockQUICConn) OpenStreamSync(context.Context) (*quic.Stream, error) {
+func (m *mockQUICConn) OpenStreamSync(
+	ctx context.Context,
+) (*quic.Stream, error) {
 	return nil, nil
 }
 
@@ -39,16 +54,18 @@ func (m *mockQUICConn) OpenUniStream() (*quic.SendStream, error) {
 	return nil, nil
 }
 
-func (m *mockQUICConn) OpenUniStreamSync(context.Context) (*quic.SendStream, error) {
+func (m *mockQUICConn) OpenUniStreamSync(
+	ctx context.Context,
+) (*quic.SendStream, error) {
 	return nil, nil
 }
 
 func (m *mockQUICConn) LocalAddr() net.Addr {
-	return nil
+	return &net.IPAddr{}
 }
 
 func (m *mockQUICConn) RemoteAddr() net.Addr {
-	return nil
+	return &net.IPAddr{}
 }
 
 func (m *mockQUICConn) CloseWithError(
@@ -59,7 +76,23 @@ func (m *mockQUICConn) CloseWithError(
 }
 
 func (m *mockQUICConn) Context() context.Context {
-	return context.Background()
+	return m.ctx
+}
+
+func (m *mockQUICConn) ConnectionState() quic.ConnectionState {
+	return quic.ConnectionState{}
+}
+
+func (m *mockQUICConn) SendDatagram(
+	payload []byte,
+) error {
+	return nil
+}
+
+func (m *mockQUICConn) ReceiveDatagram(
+	ctx context.Context,
+) ([]byte, error) {
+	return nil, nil
 }
 
 func createTestLogger(
@@ -77,28 +110,43 @@ func createTestLogger(
 	)
 
 	if err != nil {
-		t.Fatalf("logger init failed: %v", err)
+		t.Fatalf(
+			"logger init failed: %v",
+			err,
+		)
 	}
 
 	return logDisp
 }
 
-func TestPolicyEngineInitialization(t *testing.T) {
+func TestPolicyEngineInitialization(
+	t *testing.T,
+) {
 
 	db := &ultimate_db.DB{}
 
-	engine := secure_policy.NewPolicyEngine(db)
+	engine := secure_policy.NewPolicyEngine(
+		db,
+	)
 
 	if engine == nil {
-		t.Fatal("policy engine is nil")
+		t.Fatal(
+			"policy engine nil",
+		)
 	}
 }
 
-func TestSessionManagerInitialization(t *testing.T) {
+func TestSessionManagerInitialization(
+	t *testing.T,
+) {
 
 	db := &ultimate_db.DB{}
 
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	priv, err := rsa.GenerateKey(
+		rand.Reader,
+		2048,
+	)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,11 +157,15 @@ func TestSessionManagerInitialization(t *testing.T) {
 	)
 
 	if sm == nil {
-		t.Fatal("session manager nil")
+		t.Fatal(
+			"session manager nil",
+		)
 	}
 }
 
-func TestServiceKeyManagerInitialization(t *testing.T) {
+func TestServiceKeyManagerInitialization(
+	t *testing.T,
+) {
 
 	db := &ultimate_db.DB{}
 
@@ -124,15 +176,23 @@ func TestServiceKeyManagerInitialization(t *testing.T) {
 	)
 
 	if skm == nil {
-		t.Fatal("service key manager nil")
+		t.Fatal(
+			"service key manager nil",
+		)
 	}
 }
 
-func TestWebAuthnProvider(t *testing.T) {
+func TestWebAuthnProvider(
+	t *testing.T,
+) {
 
 	db := &ultimate_db.DB{}
 
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	priv, err := rsa.GenerateKey(
+		rand.Reader,
+		2048,
+	)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,15 +213,22 @@ func TestWebAuthnProvider(t *testing.T) {
 	)
 
 	if err != nil {
-		t.Fatalf("webauthn init failed: %v", err)
+		t.Fatalf(
+			"webauthn init failed: %v",
+			err,
+		)
 	}
 
 	if provider == nil {
-		t.Fatal("provider nil")
+		t.Fatal(
+			"provider nil",
+		)
 	}
 }
 
-func TestRPCManagerInitialization(t *testing.T) {
+func TestRPCManagerInitialization(
+	t *testing.T,
+) {
 
 	rpc := NewRPCManager(
 		NewPeerRoute(nil, nil, nil),
@@ -169,11 +236,15 @@ func TestRPCManagerInitialization(t *testing.T) {
 	)
 
 	if rpc == nil {
-		t.Fatal("rpc nil")
+		t.Fatal(
+			"rpc manager nil",
+		)
 	}
 }
 
-func TestRPCRegistration(t *testing.T) {
+func TestRPCRegistration(
+	t *testing.T,
+) {
 
 	rpc := NewRPCManager(
 		NewPeerRoute(nil, nil, nil),
@@ -190,6 +261,7 @@ func TestRPCRegistration(t *testing.T) {
 		) ([]byte, error) {
 
 			called = true
+
 			return []byte("pong"), nil
 		},
 	)
@@ -197,7 +269,9 @@ func TestRPCRegistration(t *testing.T) {
 	handler, ok := rpc.handlers["ping"]
 
 	if !ok {
-		t.Fatal("handler missing")
+		t.Fatal(
+			"handler missing",
+		)
 	}
 
 	resp, err := handler(
@@ -210,15 +284,21 @@ func TestRPCRegistration(t *testing.T) {
 	}
 
 	if string(resp) != "pong" {
-		t.Fatal("unexpected response")
+		t.Fatal(
+			"unexpected response",
+		)
 	}
 
 	if !called {
-		t.Fatal("handler not called")
+		t.Fatal(
+			"handler not called",
+		)
 	}
 }
 
-func TestPeerRouteLifecycle(t *testing.T) {
+func TestPeerRouteLifecycle(
+	t *testing.T,
+) {
 
 	pr := NewPeerRoute(
 		nil,
@@ -228,7 +308,10 @@ func TestPeerRouteLifecycle(t *testing.T) {
 
 	var nodeID NodeID
 
-	copy(nodeID[:], []byte("peer-1"))
+	copy(
+		nodeID[:],
+		[]byte("peer-1"),
+	)
 
 	peer := &PeerIdentity{
 		NodeID:    nodeID,
@@ -240,17 +323,23 @@ func TestPeerRouteLifecycle(t *testing.T) {
 	pr.AddPeer(peer)
 
 	if pr.PeerCount() != 1 {
-		t.Fatal("peer add failed")
+		t.Fatal(
+			"peer add failed",
+		)
 	}
 
 	pr.RemovePeer(nodeID)
 
 	if pr.PeerCount() != 0 {
-		t.Fatal("peer removal failed")
+		t.Fatal(
+			"peer removal failed",
+		)
 	}
 }
 
-func TestTunnelManagerInitialization(t *testing.T) {
+func TestTunnelManagerInitialization(
+	t *testing.T,
+) {
 
 	tm := NewTunnelManager(
 		"8443",
@@ -258,11 +347,15 @@ func TestTunnelManagerInitialization(t *testing.T) {
 	)
 
 	if tm == nil {
-		t.Fatal("tunnel manager nil")
+		t.Fatal(
+			"tunnel manager nil",
+		)
 	}
 }
 
-func TestTunnelRegistrationRejectsInvalidPayload(t *testing.T) {
+func TestTunnelRegistrationRejectsInvalidPayload(
+	t *testing.T,
+) {
 
 	tm := NewTunnelManager(
 		"8443",
@@ -270,16 +363,20 @@ func TestTunnelRegistrationRejectsInvalidPayload(t *testing.T) {
 	)
 
 	err := tm.RegisterTunnel(
-		&mockQUICConn{},
+		newMockQUICConn(),
 		[]byte("invalid-json"),
 	)
 
 	if err == nil {
-		t.Fatal("expected error")
+		t.Fatal(
+			"expected invalid payload error",
+		)
 	}
 }
 
-func TestTunnelAuthenticationUnknownIdentity(t *testing.T) {
+func TestTunnelAuthenticationUnknownIdentity(
+	t *testing.T,
+) {
 
 	tm := NewTunnelManager(
 		"8443",
@@ -293,11 +390,15 @@ func TestTunnelAuthenticationUnknownIdentity(t *testing.T) {
 	)
 
 	if err == nil {
-		t.Fatal("expected auth failure")
+		t.Fatal(
+			"expected auth failure",
+		)
 	}
 }
 
-func TestTunnelManagerName(t *testing.T) {
+func TestTunnelManagerName(
+	t *testing.T,
+) {
 
 	tm := NewTunnelManager(
 		"8443",
@@ -305,11 +406,15 @@ func TestTunnelManagerName(t *testing.T) {
 	)
 
 	if tm.Name() != "mesh_tunnel" {
-		t.Fatal("unexpected name")
+		t.Fatal(
+			"unexpected tunnel name",
+		)
 	}
 }
 
-func TestTunnelManagerInit(t *testing.T) {
+func TestTunnelManagerInit(
+	t *testing.T,
+) {
 
 	tm := NewTunnelManager(
 		"8443",
@@ -327,7 +432,9 @@ func TestTunnelManagerInit(t *testing.T) {
 	}
 }
 
-func TestTunnelAgentConfig(t *testing.T) {
+func TestTunnelAgentConfig(
+	t *testing.T,
+) {
 
 	cfg := TunnelAgentConfig{
 		GatewayAddr:  "localhost:4433",
@@ -338,18 +445,26 @@ func TestTunnelAgentConfig(t *testing.T) {
 	}
 
 	if cfg.Subdomain != "demo" {
-		t.Fatal("bad config")
+		t.Fatal(
+			"bad config",
+		)
 	}
 }
 
-func TestTLSConfigCreation(t *testing.T) {
+func TestTLSConfigCreation(
+	t *testing.T,
+) {
 
 	cfg := &tls.Config{
 		InsecureSkipVerify: true,
-		NextProtos:         []string{"secure-overlay"},
+		NextProtos: []string{
+			"secure-overlay",
+		},
 	}
 
 	if len(cfg.NextProtos) == 0 {
-		t.Fatal("tls config invalid")
+		t.Fatal(
+			"tls config invalid",
+		)
 	}
 }
