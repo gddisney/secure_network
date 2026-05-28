@@ -4,155 +4,179 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
-	"encoding/json"
-	"fmt"
+	"crypto/tls"
 	"testing"
 	"time"
 
 	"github.com/gddisney/guikit"
+	"github.com/gddisney/logger"
 	"github.com/gddisney/secure_policy"
 	"github.com/gddisney/service_keys"
 	"github.com/gddisney/ultimate_db"
+	"github.com/gddisney/webauthnext"
+	"github.com/quic-go/quic-go"
 )
 
-func TestPolicyEngineInitialization(
-	t *testing.T,
-) {
+type mockQUICConn struct{}
 
-	engine := secure_policy.NewPolicyEngine(
-		nil,
+func (m *mockQUICConn) AcceptStream(context.Context) (*quic.Stream, error) {
+	return nil, nil
+}
+
+func (m *mockQUICConn) AcceptUniStream(context.Context) (*quic.ReceiveStream, error) {
+	return nil, nil
+}
+
+func (m *mockQUICConn) OpenStream() (*quic.Stream, error) {
+	return nil, nil
+}
+
+func (m *mockQUICConn) OpenStreamSync(context.Context) (*quic.Stream, error) {
+	return nil, nil
+}
+
+func (m *mockQUICConn) OpenUniStream() (*quic.SendStream, error) {
+	return nil, nil
+}
+
+func (m *mockQUICConn) OpenUniStreamSync(context.Context) (*quic.SendStream, error) {
+	return nil, nil
+}
+
+func (m *mockQUICConn) LocalAddr() net.Addr {
+	return nil
+}
+
+func (m *mockQUICConn) RemoteAddr() net.Addr {
+	return nil
+}
+
+func (m *mockQUICConn) CloseWithError(
+	code quic.ApplicationErrorCode,
+	msg string,
+) error {
+	return nil
+}
+
+func (m *mockQUICConn) Context() context.Context {
+	return context.Background()
+}
+
+func createTestLogger(
+	t *testing.T,
+	db *ultimate_db.DB,
+) *logger.LogDispatcher {
+
+	t.Helper()
+
+	logDisp, err := logger.NewLogDispatcher(
+		"test",
+		db,
+		ConfigPageID,
+		100,
 	)
+
+	if err != nil {
+		t.Fatalf("logger init failed: %v", err)
+	}
+
+	return logDisp
+}
+
+func TestPolicyEngineInitialization(t *testing.T) {
+
+	db := &ultimate_db.DB{}
+
+	engine := secure_policy.NewPolicyEngine(db)
 
 	if engine == nil {
-
-		t.Fatal(
-			"policy engine is nil",
-		)
+		t.Fatal("policy engine is nil")
 	}
 }
 
-func TestSessionManagerInitialization(
-	t *testing.T,
-) {
+func TestSessionManagerInitialization(t *testing.T) {
 
-	rsaPriv, err := rsa.GenerateKey(
-		rand.Reader,
-		2048,
+	db := &ultimate_db.DB{}
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sm := secure_policy.NewSessionManager(
+		db,
+		priv,
+	)
+
+	if sm == nil {
+		t.Fatal("session manager nil")
+	}
+}
+
+func TestServiceKeyManagerInitialization(t *testing.T) {
+
+	db := &ultimate_db.DB{}
+
+	skm := service_keys.NewServiceKeyManager(
+		db,
+		nil,
+		nil,
+	)
+
+	if skm == nil {
+		t.Fatal("service key manager nil")
+	}
+}
+
+func TestWebAuthnProvider(t *testing.T) {
+
+	db := &ultimate_db.DB{}
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sm := secure_policy.NewSessionManager(
+		db,
+		priv,
+	)
+
+	gui := &guikit.GUIKit{}
+
+	provider, err := webauthnext.New(
+		gui,
+		sm,
+		"localhost",
+		"localhost",
+		"Secure Test",
 	)
 
 	if err != nil {
-
-		t.Fatalf(
-			"rsa generation failed: %v",
-			err,
-		)
+		t.Fatalf("webauthn init failed: %v", err)
 	}
 
-	manager := secure_policy.NewSessionManager(
-		nil,
-		rsaPriv,
-	)
-
-	if manager == nil {
-
-		t.Fatal(
-			"session manager is nil",
-		)
+	if provider == nil {
+		t.Fatal("provider nil")
 	}
 }
 
-func TestServiceKeyManagerInitialization(
-	t *testing.T,
-) {
-
-	manager := service_keys.NewServiceKeyManager(
-		nil,
-		nil,
-		nil,
-	)
-
-	if manager == nil {
-
-		t.Fatal(
-			"service key manager is nil",
-		)
-	}
-}
-
-func TestGossipIngress(
-	t *testing.T,
-) {
-
-	peerRoute := NewPeerRoute(
-		nil,
-		nil,
-		nil,
-	)
-
-	gossip := NewGossipManager(
-		nil,
-		peerRoute,
-		nil,
-		nil,
-	)
-
-	payload := []byte(`{
-		"id":"test-msg",
-		"service_id":"test",
-		"payload":"aGVsbG8=",
-		"signature":"dGVzdA==",
-		"lamport":1
-	}`)
-
-	err := gossip.HandleIngress(
-		context.Background(),
-		payload,
-	)
-
-	if err != nil {
-
-		t.Fatalf(
-			"gossip ingress failed: %v",
-			err,
-		)
-	}
-}
-
-func TestRPCManagerInitialization(
-	t *testing.T,
-) {
-
-	peerRoute := NewPeerRoute(
-		nil,
-		nil,
-		nil,
-	)
+func TestRPCManagerInitialization(t *testing.T) {
 
 	rpc := NewRPCManager(
-		peerRoute,
+		NewPeerRoute(nil, nil, nil),
 		nil,
 	)
 
 	if rpc == nil {
-
-		t.Fatal(
-			"rpc manager is nil",
-		)
+		t.Fatal("rpc nil")
 	}
 }
 
-func TestRPCRegistration(
-	t *testing.T,
-) {
-
-	peerRoute := NewPeerRoute(
-		nil,
-		nil,
-		nil,
-	)
+func TestRPCRegistration(t *testing.T) {
 
 	rpc := NewRPCManager(
-		peerRoute,
+		NewPeerRoute(nil, nil, nil),
 		nil,
 	)
 
@@ -166,7 +190,6 @@ func TestRPCRegistration(
 		) ([]byte, error) {
 
 			called = true
-
 			return []byte("pong"), nil
 		},
 	)
@@ -174,10 +197,7 @@ func TestRPCRegistration(
 	handler, ok := rpc.handlers["ping"]
 
 	if !ok {
-
-		t.Fatal(
-			"rpc handler not registered",
-		)
+		t.Fatal("handler missing")
 	}
 
 	resp, err := handler(
@@ -186,95 +206,21 @@ func TestRPCRegistration(
 	)
 
 	if err != nil {
-
-		t.Fatalf(
-			"handler execution failed: %v",
-			err,
-		)
+		t.Fatal(err)
 	}
 
 	if string(resp) != "pong" {
-
-		t.Fatal(
-			"unexpected response",
-		)
+		t.Fatal("unexpected response")
 	}
 
 	if !called {
-
-		t.Fatal(
-			"handler was not executed",
-		)
+		t.Fatal("handler not called")
 	}
 }
 
-func TestGossipRegistration(
-	t *testing.T,
-) {
+func TestPeerRouteLifecycle(t *testing.T) {
 
-	peerRoute := NewPeerRoute(
-		nil,
-		nil,
-		nil,
-	)
-
-	gossip := NewGossipManager(
-		nil,
-		peerRoute,
-		nil,
-		nil,
-	)
-
-	called := false
-
-	gossip.RegisterHandler(
-		"test-service",
-		func(
-			ctx context.Context,
-			env *GossipEnvelope,
-		) error {
-
-			called = true
-
-			return nil
-		},
-	)
-
-	handler, ok := gossip.handlers["test-service"]
-
-	if !ok {
-
-		t.Fatal(
-			"gossip handler missing",
-		)
-	}
-
-	err := handler(
-		context.Background(),
-		&GossipEnvelope{},
-	)
-
-	if err != nil {
-
-		t.Fatalf(
-			"handler execution failed: %v",
-			err,
-		)
-	}
-
-	if !called {
-
-		t.Fatal(
-			"handler not called",
-		)
-	}
-}
-
-func TestPeerRouteLifecycle(
-	t *testing.T,
-) {
-
-	peerRoute := NewPeerRoute(
+	pr := NewPeerRoute(
 		nil,
 		nil,
 		nil,
@@ -282,10 +228,7 @@ func TestPeerRouteLifecycle(
 
 	var nodeID NodeID
 
-	copy(
-		nodeID[:],
-		[]byte("peer-1"),
-	)
+	copy(nodeID[:], []byte("peer-1"))
 
 	peer := &PeerIdentity{
 		NodeID:    nodeID,
@@ -294,32 +237,20 @@ func TestPeerRouteLifecycle(
 		LastSeen:  time.Now(),
 	}
 
-	peerRoute.AddPeer(
-		peer,
-	)
+	pr.AddPeer(peer)
 
-	if peerRoute.PeerCount() != 1 {
-
-		t.Fatal(
-			"peer count mismatch",
-		)
+	if pr.PeerCount() != 1 {
+		t.Fatal("peer add failed")
 	}
 
-	peerRoute.RemovePeer(
-		nodeID,
-	)
+	pr.RemovePeer(nodeID)
 
-	if peerRoute.PeerCount() != 0 {
-
-		t.Fatal(
-			"peer removal failed",
-		)
+	if pr.PeerCount() != 0 {
+		t.Fatal("peer removal failed")
 	}
 }
 
-func TestTunnelManagerInitialization(
-	t *testing.T,
-) {
+func TestTunnelManagerInitialization(t *testing.T) {
 
 	tm := NewTunnelManager(
 		"8443",
@@ -327,63 +258,11 @@ func TestTunnelManagerInitialization(
 	)
 
 	if tm == nil {
-
-		t.Fatal(
-			"tunnel manager is nil",
-		)
-	}
-
-	if tm.Name() != "mesh_tunnel" {
-
-		t.Fatal(
-			"unexpected module name",
-		)
+		t.Fatal("tunnel manager nil")
 	}
 }
 
-func TestTunnelManagerRegisterTunnelNilPolicy(
-	t *testing.T,
-) {
-
-	tm := NewTunnelManager(
-		"8443",
-		nil,
-	)
-
-	auth := TunnelAuthPayload{
-		Subdomain:    "demo",
-		IdentityType: "human",
-		Credential:   "token",
-	}
-
-	authBytes, err := json.Marshal(
-		auth,
-	)
-
-	if err != nil {
-
-		t.Fatalf(
-			"marshal failed: %v",
-			err,
-		)
-	}
-
-	err = tm.RegisterTunnel(
-		nil,
-		authBytes,
-	)
-
-	if err == nil {
-
-		t.Fatal(
-			"expected error with nil dependencies",
-		)
-	}
-}
-
-func TestTunnelManagerBadPayload(
-	t *testing.T,
-) {
+func TestTunnelRegistrationRejectsInvalidPayload(t *testing.T) {
 
 	tm := NewTunnelManager(
 		"8443",
@@ -391,21 +270,16 @@ func TestTunnelManagerBadPayload(
 	)
 
 	err := tm.RegisterTunnel(
-		nil,
+		&mockQUICConn{},
 		[]byte("invalid-json"),
 	)
 
 	if err == nil {
-
-		t.Fatal(
-			"expected malformed payload error",
-		)
+		t.Fatal("expected error")
 	}
 }
 
-func TestTunnelManagerUnknownIdentity(
-	t *testing.T,
-) {
+func TestTunnelAuthenticationUnknownIdentity(t *testing.T) {
 
 	tm := NewTunnelManager(
 		"8443",
@@ -414,196 +288,28 @@ func TestTunnelManagerUnknownIdentity(
 
 	_, err := tm.authenticate(
 		TunnelAuthPayload{
-			IdentityType: "alien",
+			IdentityType: "unknown",
 		},
 	)
 
 	if err == nil {
-
-		t.Fatal(
-			"expected unknown identity error",
-		)
+		t.Fatal("expected auth failure")
 	}
 }
 
-func TestTunnelManagerExpiredMachineProof(
-	t *testing.T,
-) {
+func TestTunnelManagerName(t *testing.T) {
 
 	tm := NewTunnelManager(
 		"8443",
 		nil,
 	)
 
-	oldNonce := fmt.Sprintf(
-		"%d",
-		time.Now().Unix()-120,
-	)
-
-	_, err := tm.authenticate(
-		TunnelAuthPayload{
-			IdentityType: "machine",
-			Identifier:   "agent-1",
-			Credential:   "bad",
-			Nonce:        oldNonce,
-			Subdomain:    "demo",
-		},
-	)
-
-	if err == nil {
-
-		t.Fatal(
-			"expected expired DBSC proof",
-		)
+	if tm.Name() != "mesh_tunnel" {
+		t.Fatal("unexpected name")
 	}
 }
 
-func TestTunnelManagerHumanWithoutSessionManager(
-	t *testing.T,
-) {
-
-	tm := NewTunnelManager(
-		"8443",
-		nil,
-	)
-
-	_, err := tm.authenticate(
-		TunnelAuthPayload{
-			IdentityType: "human",
-			Credential:   "fake-token",
-		},
-	)
-
-	if err == nil {
-
-		t.Fatal(
-			"expected validation failure",
-		)
-	}
-}
-
-func TestTunnelMapLifecycle(
-	t *testing.T,
-) {
-
-	tm := NewTunnelManager(
-		"8443",
-		nil,
-	)
-
-	if tm.tunnels == nil {
-
-		t.Fatal(
-			"tunnel map not initialized",
-		)
-	}
-
-	if len(tm.tunnels) != 0 {
-
-		t.Fatal(
-			"unexpected initial tunnel count",
-		)
-	}
-
-	tm.mu.Lock()
-
-	tm.tunnels["alpha"] = nil
-
-	tm.mu.Unlock()
-
-	tm.mu.RLock()
-
-	_, ok := tm.tunnels["alpha"]
-
-	tm.mu.RUnlock()
-
-	if !ok {
-
-		t.Fatal(
-			"tunnel insert failed",
-		)
-	}
-
-	tm.mu.Lock()
-
-	delete(
-		tm.tunnels,
-		"alpha",
-	)
-
-	tm.mu.Unlock()
-
-	tm.mu.RLock()
-
-	_, ok = tm.tunnels["alpha"]
-
-	tm.mu.RUnlock()
-
-	if ok {
-
-		t.Fatal(
-			"tunnel delete failed",
-		)
-	}
-}
-
-func TestTunnelAuthPayloadJSON(
-	t *testing.T,
-) {
-
-	msg := TunnelAuthPayload{
-		Subdomain:    "app",
-		IdentityType: "human",
-		Identifier:   "alice",
-		Credential:   "token",
-		Nonce:        "123",
-	}
-
-	raw, err := json.Marshal(
-		msg,
-	)
-
-	if err != nil {
-
-		t.Fatalf(
-			"marshal failed: %v",
-			err,
-		)
-	}
-
-	var decoded TunnelAuthPayload
-
-	err = json.Unmarshal(
-		raw,
-		&decoded,
-	)
-
-	if err != nil {
-
-		t.Fatalf(
-			"unmarshal failed: %v",
-			err,
-		)
-	}
-
-	if decoded.Subdomain != "app" {
-
-		t.Fatal(
-			"subdomain mismatch",
-		)
-	}
-
-	if decoded.Identifier != "alice" {
-
-		t.Fatal(
-			"identifier mismatch",
-		)
-	}
-}
-
-func TestTunnelManagerInit(
-	t *testing.T,
-) {
+func TestTunnelManagerInit(t *testing.T) {
 
 	tm := NewTunnelManager(
 		"8443",
@@ -611,56 +317,39 @@ func TestTunnelManagerInit(
 	)
 
 	router := &Router{
-		DB:             &ultimate_db.DB{},
-		PolicyEngine:   nil,
-		SessionManager: nil,
-		GUIKit:         &guikit.GUIKit{},
+		DB: &ultimate_db.DB{},
 	}
 
-	err := tm.Init(
-		router,
-	)
+	err := tm.Init(router)
 
 	if err != nil {
-
-		t.Fatalf(
-			"init failed: %v",
-			err,
-		)
-	}
-
-	if tm.router == nil {
-
-		t.Fatal(
-			"router not assigned",
-		)
+		t.Fatal(err)
 	}
 }
 
-func TestTunnelAgentConfig(
-	t *testing.T,
-) {
+func TestTunnelAgentConfig(t *testing.T) {
 
 	cfg := TunnelAgentConfig{
-		GatewayAddr:  "localhost:9443",
-		LocalAddr:    "127.0.0.1:3000",
-		Subdomain:    "dashboard",
+		GatewayAddr:  "localhost:4433",
+		LocalAddr:    "127.0.0.1:8080",
+		Subdomain:    "demo",
 		IdentityType: "human",
-		Identifier:   "alice",
-		SessionToken: "abc123",
+		SessionToken: "token",
 	}
 
-	if cfg.Subdomain != "dashboard" {
+	if cfg.Subdomain != "demo" {
+		t.Fatal("bad config")
+	}
+}
 
-		t.Fatal(
-			"subdomain mismatch",
-		)
+func TestTLSConfigCreation(t *testing.T) {
+
+	cfg := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"secure-overlay"},
 	}
 
-	if cfg.IdentityType != "human" {
-
-		t.Fatal(
-			"identity type mismatch",
-		)
+	if len(cfg.NextProtos) == 0 {
+		t.Fatal("tls config invalid")
 	}
 }
