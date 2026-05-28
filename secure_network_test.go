@@ -4,13 +4,15 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/gddisney/guikit"
 	"github.com/gddisney/secure_policy"
 	"github.com/gddisney/service_keys"
-	"github.com/gddisney/webauthnext"
+	"github.com/gddisney/ultimate_db"
 )
 
 func TestPolicyEngineInitialization(
@@ -115,7 +117,6 @@ func TestGossipIngress(
 		)
 	}
 }
-
 
 func TestRPCManagerInitialization(
 	t *testing.T,
@@ -613,6 +614,7 @@ func TestTunnelManagerInit(
 		DB:             &ultimate_db.DB{},
 		PolicyEngine:   nil,
 		SessionManager: nil,
+		GUIKit:         &guikit.GUIKit{},
 	}
 
 	err := tm.Init(
