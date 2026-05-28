@@ -9,10 +9,8 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"sync"
 
 	"github.com/flynn/noise"
@@ -96,6 +94,7 @@ func loadOrGenerateKeys(
 	}
 
 	if sysLog != nil {
+
 		sysLog.Info(
 			"No mesh identity found. Generating new node keys...",
 		)
@@ -107,12 +106,18 @@ func loadOrGenerateKeys(
 		noise.HashSHA256,
 	)
 
-	kp, err := cipher.GenerateKeypair(rand.Reader)
+	kp, err := cipher.GenerateKeypair(
+		rand.Reader,
+	)
+
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	_, dbscPriv, err := ed25519.GenerateKey(rand.Reader)
+	_, dbscPriv, err := ed25519.GenerateKey(
+		rand.Reader,
+	)
+
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -124,6 +129,7 @@ func loadOrGenerateKeys(
 		kp.Private,
 		0,
 	); err != nil {
+
 		return nil, nil, nil, err
 	}
 
@@ -134,6 +140,7 @@ func loadOrGenerateKeys(
 		kp.Public,
 		0,
 	); err != nil {
+
 		return nil, nil, nil, err
 	}
 
@@ -144,6 +151,7 @@ func loadOrGenerateKeys(
 		[]byte(dbscPriv),
 		0,
 	); err != nil {
+
 		return nil, nil, nil, err
 	}
 
@@ -169,6 +177,7 @@ func NewMeshNode(
 	)
 
 	if err != nil {
+
 		return nil,
 			fmt.Errorf(
 				"failed to initialize mesh identity: %w",
@@ -181,12 +190,16 @@ func NewMeshNode(
 	)
 
 	node := &MeshNode{
-		db:          db,
-		noisePriv:   nPriv,
-		noisePub:    nPub,
-		dbscPriv:    dPriv,
-		gatePub:     gatePub,
-		cipher:      noise.NewCipherSuite(noise.DH25519, noise.CipherAESGCM, noise.HashSHA256),
+		db:        db,
+		noisePriv: nPriv,
+		noisePub:  nPub,
+		dbscPriv:  dPriv,
+		gatePub:   gatePub,
+		cipher: noise.NewCipherSuite(
+			noise.DH25519,
+			noise.CipherAESGCM,
+			noise.HashSHA256,
+		),
 		serviceKeys: skm,
 		Logger:      sysLog,
 		ctx:         ctx,
@@ -217,7 +230,9 @@ func (m *MeshNode) Connect(
 
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
-		NextProtos:         []string{"secure-overlay"},
+		NextProtos: []string{
+			"secure-overlay",
+		},
 	}
 
 	conn, err := quic.DialAddr(
@@ -228,15 +243,24 @@ func (m *MeshNode) Connect(
 	)
 
 	if err != nil {
+
 		return fmt.Errorf(
 			"mesh QUIC dial failed: %w",
 			err,
 		)
 	}
 
-	stream, err := conn.OpenStreamSync(ctx)
+	stream, err := conn.OpenStreamSync(
+		ctx,
+	)
+
 	if err != nil {
-		conn.CloseWithError(0, "stream open failed")
+
+		conn.CloseWithError(
+			0,
+			"stream open failed",
+		)
+
 		return err
 	}
 
@@ -255,7 +279,12 @@ func (m *MeshNode) Connect(
 	)
 
 	if err != nil {
-		conn.CloseWithError(0, "noise init failed")
+
+		conn.CloseWithError(
+			0,
+			"noise init failed",
+		)
+
 		return err
 	}
 
@@ -265,7 +294,12 @@ func (m *MeshNode) Connect(
 	)
 
 	if err != nil {
-		conn.CloseWithError(0, "noise write failed")
+
+		conn.CloseWithError(
+			0,
+			"noise write failed",
+		)
+
 		return err
 	}
 
@@ -288,6 +322,7 @@ func (m *MeshNode) Connect(
 	)
 
 	if err != nil {
+
 		conn.CloseWithError(
 			0,
 			"handshake read failed",
@@ -312,8 +347,8 @@ func (m *MeshNode) Connect(
 		)
 	}
 
-	m.conn = &conn
-	m.stream = &stream
+	m.conn = conn
+	m.stream = stream
 	m.csSend = csSend
 	m.csRecv = csRecv
 
@@ -338,7 +373,7 @@ func (m *MeshNode) Close() error {
 
 	if m.conn != nil {
 
-		return (*m.conn).CloseWithError(
+		return m.conn.CloseWithError(
 			0,
 			"shutdown",
 		)
@@ -359,7 +394,10 @@ func (m *MeshNode) SendAction(
 		)
 	}
 
-	data, err := json.Marshal(payload)
+	data, err := json.Marshal(
+		payload,
+	)
+
 	if err != nil {
 		return err
 	}
@@ -508,7 +546,9 @@ func (m *MeshNode) handleHeartbeat(
 		),
 	}
 
-	_ = m.SendAction(payload)
+	_ = m.SendAction(
+		payload,
+	)
 }
 
 func (m *MeshNode) VerifyMachineIdentity(
@@ -537,6 +577,7 @@ func (m *MeshNode) VerifyMachineIdentity(
 		userBytes,
 		&user,
 	); err != nil {
+
 		return err
 	}
 
@@ -554,8 +595,12 @@ func (m *MeshNode) VerifyMachineIdentity(
 	}
 
 	rsaKey, ok := cryptoKey.(*rsa.PublicKey)
+
 	if !ok {
-		return fmt.Errorf("invalid RSA public key")
+
+		return fmt.Errorf(
+			"invalid RSA public key",
+		)
 	}
 
 	sigBytes, err := base64.StdEncoding.DecodeString(
@@ -582,75 +627,4 @@ func (m *MeshNode) VerifyMachineIdentity(
 		hash[:],
 		sigBytes,
 	)
-}
-
-func WriteFrame(
-	w io.Writer,
-	payload []byte,
-) error {
-
-	size := uint32(len(payload))
-
-	var hdr [4]byte
-
-	binary.BigEndian.PutUint32(
-		hdr[:],
-		size,
-	)
-
-	if _, err := w.Write(
-		hdr[:],
-	); err != nil {
-
-		return err
-	}
-
-	_, err := w.Write(payload)
-
-	return err
-}
-
-func ReadFrame(
-	r io.Reader,
-	maxSize uint32,
-) ([]byte, error) {
-
-	var hdr [4]byte
-
-	if _, err := io.ReadFull(
-		r,
-		hdr[:],
-	); err != nil {
-
-		return nil, err
-	}
-
-	size := binary.BigEndian.Uint32(
-		hdr[:],
-	)
-
-	if size == 0 {
-
-		return nil,
-			fmt.Errorf(
-				"empty frame",
-			)
-	}
-
-	if size > maxSize {
-
-		return nil,
-			fmt.Errorf(
-				"frame exceeds max size",
-			)
-	}
-
-	buf := make([]byte, size)
-
-	_, err := io.ReadFull(
-		r,
-		buf,
-	)
-
-	return buf, err
 }
