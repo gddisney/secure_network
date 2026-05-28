@@ -16,7 +16,7 @@ type RPCPacket struct {
 	ID        string `json:"id"`
 	Method    string `json:"method"`
 	Payload   []byte `json:"payload"`
-	Source    []byte `json:"source"`
+	Source    []byte `json:"source,omitempty"`
 	Target    []byte `json:"target,omitempty"`
 	Timestamp int64  `json:"timestamp"`
 	Response  bool   `json:"response"`
@@ -55,6 +55,14 @@ func NewRPCManager(
 		handlers:  make(map[string]RPCHandler),
 		pending:   make(map[string]*pendingRPC),
 	}
+}
+
+func (m *RPCManager) Init() error {
+	return nil
+}
+
+func (m *RPCManager) Name() string {
+	return "rpc_manager"
 }
 
 func (m *RPCManager) Register(
@@ -127,10 +135,12 @@ func (m *RPCManager) Call(
 	defer func() {
 
 		m.mu.Lock()
+
 		delete(
 			m.pending,
 			reqID,
 		)
+
 		m.mu.Unlock()
 	}()
 
@@ -153,6 +163,7 @@ func (m *RPCManager) Call(
 
 			return nil,
 				fmt.Errorf(
+					"%s",
 					resp.Error,
 				)
 		}
@@ -161,7 +172,8 @@ func (m *RPCManager) Call(
 
 	case <-ctx.Done():
 
-		return nil, ctx.Err()
+		return nil,
+			ctx.Err()
 
 	case <-time.After(timeout):
 
@@ -195,6 +207,65 @@ func (m *RPCManager) Broadcast(
 
 	return m.peerRoute.Broadcast(
 		ctx,
+		"rpc",
+		raw,
+	)
+}
+
+func (m *RPCManager) Notify(
+	ctx context.Context,
+	method string,
+	payload []byte,
+) error {
+
+	packet := RPCPacket{
+		Method:    method,
+		Payload:   payload,
+		Timestamp: time.Now().Unix(),
+		Response:  false,
+	}
+
+	raw, err := json.Marshal(
+		packet,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	return m.peerRoute.Broadcast(
+		ctx,
+		"rpc",
+		raw,
+	)
+}
+
+func (m *RPCManager) NotifyPeer(
+	ctx context.Context,
+	target []byte,
+	method string,
+	payload []byte,
+) error {
+
+	packet := RPCPacket{
+		Method:    method,
+		Payload:   payload,
+		Target:    target,
+		Timestamp: time.Now().Unix(),
+		Response:  false,
+	}
+
+	raw, err := json.Marshal(
+		packet,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	return m.peerRoute.SendToPeer(
+		ctx,
+		target,
 		"rpc",
 		raw,
 	)
@@ -322,63 +393,4 @@ func (m *RPCManager) handleIngress(
 			raw,
 		)
 	}
-}
-
-func (m *RPCManager) Notify(
-	ctx context.Context,
-	method string,
-	payload []byte,
-) error {
-
-	packet := RPCPacket{
-		Method:    method,
-		Payload:   payload,
-		Timestamp: time.Now().Unix(),
-		Response:  false,
-	}
-
-	raw, err := json.Marshal(
-		packet,
-	)
-
-	if err != nil {
-		return err
-	}
-
-	return m.peerRoute.Broadcast(
-		ctx,
-		"rpc",
-		raw,
-	)
-}
-
-func (m *RPCManager) NotifyPeer(
-	ctx context.Context,
-	target []byte,
-	method string,
-	payload []byte,
-) error {
-
-	packet := RPCPacket{
-		Method:    method,
-		Payload:   payload,
-		Target:    target,
-		Timestamp: time.Now().Unix(),
-		Response:  false,
-	}
-
-	raw, err := json.Marshal(
-		packet,
-	)
-
-	if err != nil {
-		return err
-	}
-
-	return m.peerRoute.SendToPeer(
-		ctx,
-		target,
-		"rpc",
-		raw,
-	)
 }
