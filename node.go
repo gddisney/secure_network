@@ -5,12 +5,13 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"fmt"
+	"time"
 
 	"github.com/gddisney/logger"
+	"github.com/gddisney/secure_policy"
 	"github.com/gddisney/service_keys"
 	"github.com/gddisney/ultimate_db"
 	"github.com/gddisney/webauthnext"
-	"github.com/gddisney/secure_policy"
 )
 
 type SecureNode struct {
@@ -52,22 +53,25 @@ func NewSecureNode(
 			)
 	}
 
+	var err error
+
 	if sysLog == nil {
 
-		sysLog = logger.NewLogDispatcher()
-	}
+		sysLog, err = logger.NewLogDispatcher(
+			"secure_node",
+			db,
+			ConfigPageID,
+			1000,
+		)
 
-	bp := db.BufferPool()
+		if err != nil {
 
-	_, err := bp.NewPage()
-
-	if err != nil {
-
-		return nil,
-			fmt.Errorf(
-				"failed creating bootstrap page: %w",
-				err,
-			)
+			return nil,
+				fmt.Errorf(
+					"failed to initialize logger: %w",
+					err,
+				)
+		}
 	}
 
 	rsaPrivKey, err := rsa.GenerateKey(
@@ -93,6 +97,23 @@ func NewSecureNode(
 		rsaPrivKey,
 	)
 
+	webAuthnProvider, err := webauthnext.New(
+		nil,
+		sessionManager,
+		rpID,
+		rpOrigin,
+		rpName,
+	)
+
+	if err != nil {
+
+		return nil,
+			fmt.Errorf(
+				"failed creating webauthn provider: %w",
+				err,
+			)
+	}
+
 	skm, err := service_keys.LoadOrCreateManager(
 		db,
 		sysLog,
@@ -107,13 +128,7 @@ func NewSecureNode(
 			)
 	}
 
-	webAuthnProvider := webauthnext.New(
-		nil,
-		sessionManager,
-		rpID,
-		rpOrigin,
-		rpName,
-	)
+	skm.Provider = webAuthnProvider
 
 	meshNode, err := NewMeshNode(
 		db,
@@ -168,9 +183,9 @@ func NewSecureNode(
 
 	gossipManager.StartJanitor()
 
-	if sysLog != nil {
+	if node.Logger != nil {
 
-		sysLog.Info(
+		node.Logger.Info(
 			"Secure node initialized",
 		)
 	}
@@ -236,7 +251,7 @@ func (n *SecureNode) RegisterGossip(
 	)
 }
 
-func (n *SecureNode) Broadcast(
+func (n *SecureNode) BroadcastRPC(
 	ctx context.Context,
 	method string,
 	payload []byte,
@@ -250,6 +265,26 @@ func (n *SecureNode) Broadcast(
 	}
 
 	return n.RPC.Broadcast(
+		ctx,
+		method,
+		payload,
+	)
+}
+
+func (n *SecureNode) NotifyRPC(
+	ctx context.Context,
+	method string,
+	payload []byte,
+) error {
+
+	if n.RPC == nil {
+
+		return fmt.Errorf(
+			"rpc unavailable",
+		)
+	}
+
+	return n.RPC.Notify(
 		ctx,
 		method,
 		payload,
@@ -280,6 +315,43 @@ func (n *SecureNode) CallPeer(
 	)
 }
 
+func (n *SecureNode) PublishGossip(
+	ctx context.Context,
+	serviceID string,
+	payload []byte,
+	signature []byte,
+) error {
+
+	if n.Gossip == nil {
+
+		return fmt.Errorf(
+			"gossip unavailable",
+		)
+	}
+
+	return n.Gossip.Publish(
+		ctx,
+		serviceID,
+		payload,
+		signature,
+	)
+}
+
+func (n *SecureNode) PeerCount() int {
+
+	if n.PeerRoute == nil {
+		return 0
+	}
+
+	return n.PeerRoute.PeerCount()
+}
+
+func (n *SecureNode) IsMeshConnected() bool {
+
+	return n.Mesh != nil &&
+		n.Mesh.conn != nil
+}
+
 const (
-	DefaultRPCTimeout = 15_000_000_000
+	DefaultRPCTimeout = 15 * time.Second
 )
