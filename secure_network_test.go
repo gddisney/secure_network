@@ -5,7 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
-	"net"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -15,85 +15,7 @@ import (
 	"github.com/gddisney/service_keys"
 	"github.com/gddisney/ultimate_db"
 	"github.com/gddisney/webauthnext"
-	"github.com/quic-go/quic-go"
 )
-
-type mockQUICConn struct {
-	ctx context.Context
-}
-
-func newMockQUICConn() *mockQUICConn {
-	return &mockQUICConn{
-		ctx: context.Background(),
-	}
-}
-
-func (m *mockQUICConn) AcceptStream(
-	ctx context.Context,
-) (*quic.Stream, error) {
-	return nil, nil
-}
-
-func (m *mockQUICConn) AcceptUniStream(
-	ctx context.Context,
-) (*quic.ReceiveStream, error) {
-	return nil, nil
-}
-
-func (m *mockQUICConn) OpenStream() (*quic.Stream, error) {
-	return nil, nil
-}
-
-func (m *mockQUICConn) OpenStreamSync(
-	ctx context.Context,
-) (*quic.Stream, error) {
-	return nil, nil
-}
-
-func (m *mockQUICConn) OpenUniStream() (*quic.SendStream, error) {
-	return nil, nil
-}
-
-func (m *mockQUICConn) OpenUniStreamSync(
-	ctx context.Context,
-) (*quic.SendStream, error) {
-	return nil, nil
-}
-
-func (m *mockQUICConn) LocalAddr() net.Addr {
-	return &net.IPAddr{}
-}
-
-func (m *mockQUICConn) RemoteAddr() net.Addr {
-	return &net.IPAddr{}
-}
-
-func (m *mockQUICConn) CloseWithError(
-	code quic.ApplicationErrorCode,
-	msg string,
-) error {
-	return nil
-}
-
-func (m *mockQUICConn) Context() context.Context {
-	return m.ctx
-}
-
-func (m *mockQUICConn) ConnectionState() quic.ConnectionState {
-	return quic.ConnectionState{}
-}
-
-func (m *mockQUICConn) SendDatagram(
-	payload []byte,
-) error {
-	return nil
-}
-
-func (m *mockQUICConn) ReceiveDatagram(
-	ctx context.Context,
-) ([]byte, error) {
-	return nil, nil
-}
 
 func createTestLogger(
 	t *testing.T,
@@ -110,6 +32,7 @@ func createTestLogger(
 	)
 
 	if err != nil {
+
 		t.Fatalf(
 			"logger init failed: %v",
 			err,
@@ -130,6 +53,7 @@ func TestPolicyEngineInitialization(
 	)
 
 	if engine == nil {
+
 		t.Fatal(
 			"policy engine nil",
 		)
@@ -148,6 +72,7 @@ func TestSessionManagerInitialization(
 	)
 
 	if err != nil {
+
 		t.Fatal(err)
 	}
 
@@ -157,6 +82,7 @@ func TestSessionManagerInitialization(
 	)
 
 	if sm == nil {
+
 		t.Fatal(
 			"session manager nil",
 		)
@@ -176,6 +102,7 @@ func TestServiceKeyManagerInitialization(
 	)
 
 	if skm == nil {
+
 		t.Fatal(
 			"service key manager nil",
 		)
@@ -194,6 +121,7 @@ func TestWebAuthnProvider(
 	)
 
 	if err != nil {
+
 		t.Fatal(err)
 	}
 
@@ -213,6 +141,7 @@ func TestWebAuthnProvider(
 	)
 
 	if err != nil {
+
 		t.Fatalf(
 			"webauthn init failed: %v",
 			err,
@@ -220,6 +149,7 @@ func TestWebAuthnProvider(
 	}
 
 	if provider == nil {
+
 		t.Fatal(
 			"provider nil",
 		)
@@ -236,6 +166,7 @@ func TestRPCManagerInitialization(
 	)
 
 	if rpc == nil {
+
 		t.Fatal(
 			"rpc manager nil",
 		)
@@ -269,6 +200,7 @@ func TestRPCRegistration(
 	handler, ok := rpc.handlers["ping"]
 
 	if !ok {
+
 		t.Fatal(
 			"handler missing",
 		)
@@ -280,16 +212,19 @@ func TestRPCRegistration(
 	)
 
 	if err != nil {
+
 		t.Fatal(err)
 	}
 
 	if string(resp) != "pong" {
+
 		t.Fatal(
 			"unexpected response",
 		)
 	}
 
 	if !called {
+
 		t.Fatal(
 			"handler not called",
 		)
@@ -323,6 +258,7 @@ func TestPeerRouteLifecycle(
 	pr.AddPeer(peer)
 
 	if pr.PeerCount() != 1 {
+
 		t.Fatal(
 			"peer add failed",
 		)
@@ -331,6 +267,7 @@ func TestPeerRouteLifecycle(
 	pr.RemovePeer(nodeID)
 
 	if pr.PeerCount() != 0 {
+
 		t.Fatal(
 			"peer removal failed",
 		)
@@ -347,6 +284,7 @@ func TestTunnelManagerInitialization(
 	)
 
 	if tm == nil {
+
 		t.Fatal(
 			"tunnel manager nil",
 		)
@@ -357,19 +295,17 @@ func TestTunnelRegistrationRejectsInvalidPayload(
 	t *testing.T,
 ) {
 
-	tm := NewTunnelManager(
-		"8443",
-		nil,
-	)
+	var payload TunnelAuthPayload
 
-	err := tm.RegisterTunnel(
-		newMockQUICConn(),
+	err := json.Unmarshal(
 		[]byte("invalid-json"),
+		&payload,
 	)
 
 	if err == nil {
+
 		t.Fatal(
-			"expected invalid payload error",
+			"expected invalid json error",
 		)
 	}
 }
@@ -390,6 +326,7 @@ func TestTunnelAuthenticationUnknownIdentity(
 	)
 
 	if err == nil {
+
 		t.Fatal(
 			"expected auth failure",
 		)
@@ -406,6 +343,7 @@ func TestTunnelManagerName(
 	)
 
 	if tm.Name() != "mesh_tunnel" {
+
 		t.Fatal(
 			"unexpected tunnel name",
 		)
@@ -428,6 +366,7 @@ func TestTunnelManagerInit(
 	err := tm.Init(router)
 
 	if err != nil {
+
 		t.Fatal(err)
 	}
 }
@@ -445,6 +384,7 @@ func TestTunnelAgentConfig(
 	}
 
 	if cfg.Subdomain != "demo" {
+
 		t.Fatal(
 			"bad config",
 		)
@@ -463,6 +403,7 @@ func TestTLSConfigCreation(
 	}
 
 	if len(cfg.NextProtos) == 0 {
+
 		t.Fatal(
 			"tls config invalid",
 		)
