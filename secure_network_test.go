@@ -10,7 +10,6 @@ import (
 	"github.com/gddisney/guikit"
 	"github.com/gddisney/secure_policy"
 	"github.com/gddisney/service_keys"
-	"github.com/gddisney/ultimate_db"
 	"github.com/gddisney/webauthnext"
 )
 
