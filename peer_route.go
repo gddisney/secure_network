@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"sync"
 	"time"
 
 	"github.com/flynn/noise"
@@ -39,24 +41,39 @@ type SwarmObject struct {
 }
 
 type RoutingEntry struct {
-	ID      NodeID `json:"id"`
-	Address string `json:"address"`
+	ID        NodeID    `json:"id"`
+	Address   string    `json:"address"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
-type IngressHandler func(context.Context, []byte, *noise.CipherState) error
+type IngressHandler func(
+	context.Context,
+	[]byte,
+	*noise.CipherState,
+) error
 
 type PeerRoute struct {
 	db             *ultimate_db.DB
 	gateway        *Gateway
 	auth           *webauthnext.Provider
 	localID        NodeID
-	policies       map[NodeID]AccessLevel
 	ingressHandler IngressHandler
-	Logger         *logger.LogDispatcher // Injected Logger
+
+	policies   map[NodeID]AccessLevel
+	policiesMu sync.RWMutex
+
+	Logger *logger.LogDispatcher
 }
 
-func NewPeerRoute(db *ultimate_db.DB, auth *webauthnext.Provider, hardwareKey []byte, sysLog *logger.LogDispatcher) *PeerRoute {
+func NewPeerRoute(
+	db *ultimate_db.DB,
+	auth *webauthnext.Provider,
+	hardwareKey []byte,
+	sysLog *logger.LogDispatcher,
+) *PeerRoute {
+
 	localHash := sha256.Sum256(hardwareKey)
+
 	return &PeerRoute{
 		db:       db,
 		auth:     auth,
@@ -70,65 +87,181 @@ func (p *PeerRoute) SetGateway(g *Gateway) {
 	p.gateway = g
 }
 
-func (p *PeerRoute) SetIngressHandler(handler IngressHandler) {
+func (p *PeerRoute) SetIngressHandler(
+	handler IngressHandler,
+) {
 	p.ingressHandler = handler
 }
 
-func (p *PeerRoute) Listen(ctx context.Context) {
+func (p *PeerRoute) Listen(
+	ctx context.Context,
+) {
+
 	if p.Logger != nil {
-		p.Logger.Info("Listening for incoming routing mesh connections...")
+		p.Logger.Info(
+			"PeerRoute listener active",
+		)
+	}
+
+	<-ctx.Done()
+
+	if p.Logger != nil {
+		p.Logger.Info(
+			"PeerRoute listener shutting down",
+		)
 	}
 }
 
-func (p *PeerRoute) Broadcast(ctx context.Context, payload []byte) {
+func (p *PeerRoute) Broadcast(
+	ctx context.Context,
+	payload []byte,
+) {
+
 	if p.Logger != nil {
-		p.Logger.Debug(fmt.Sprintf("Broadcasting payload: %d bytes", len(payload)))
+
+		p.Logger.Debug(
+			fmt.Sprintf(
+				"Broadcasting payload (%d bytes)",
+				len(payload),
+			),
+		)
+	}
+
+	if p.gateway != nil {
+
+		if broadcaster, ok := any(p.gateway).(interface {
+			Broadcast(context.Context, []byte) error
+		}); ok {
+
+			if err := broadcaster.Broadcast(
+				ctx,
+				payload,
+			); err != nil {
+
+				if p.Logger != nil {
+
+					p.Logger.Error(
+						fmt.Sprintf(
+							"Broadcast failed: %v",
+							err,
+						),
+					)
+				}
+			}
+		}
 	}
 }
 
-func (p *PeerRoute) SetAccessPolicy(remoteID NodeID, level AccessLevel) {
+func (p *PeerRoute) SetAccessPolicy(
+	remoteID NodeID,
+	level AccessLevel,
+) {
+
+	p.policiesMu.Lock()
+	defer p.policiesMu.Unlock()
+
 	p.policies[remoteID] = level
+
+	if p.Logger != nil {
+
+		p.Logger.Audit(
+			fmt.Sprintf("%x", remoteID[:8]),
+			"ACCESS_POLICY_UPDATED",
+			fmt.Sprintf(
+				"Policy set to level %d",
+				level,
+			),
+		)
+	}
 }
 
-func (p *PeerRoute) EvaluateSwarmHandshake(remoteIdentity []byte, intent string) (bool, error) {
+func (p *PeerRoute) EvaluateSwarmHandshake(
+	remoteIdentity []byte,
+	intent string,
+) (bool, error) {
+
 	var remoteID NodeID
 	copy(remoteID[:], remoteIdentity)
 
+	p.policiesMu.RLock()
 	level, exists := p.policies[remoteID]
+	p.policiesMu.RUnlock()
+
 	if !exists {
+
 		if p.Logger != nil {
-			p.Logger.Audit(fmt.Sprintf("%x", remoteIdentity[:8]), "HANDSHAKE_REJECTED", "Connection rejected: no cryptographic access policy established")
+
+			p.Logger.Audit(
+				fmt.Sprintf("%x", remoteIdentity[:8]),
+				"HANDSHAKE_REJECTED",
+				"No access policy established",
+			)
 		}
-		return false, errors.New("connection rejected: no cryptographic access policy established")
+
+		return false, errors.New(
+			"connection rejected: no access policy established",
+		)
 	}
 
 	switch level {
+
 	case Reject:
+
 		if p.Logger != nil {
-			p.Logger.Audit(fmt.Sprintf("%x", remoteIdentity[:8]), "HANDSHAKE_REJECTED", "Connection actively rejected by peer policy")
+
+			p.Logger.Audit(
+				fmt.Sprintf("%x", remoteIdentity[:8]),
+				"HANDSHAKE_REJECTED",
+				"Peer explicitly rejected",
+			)
 		}
-		return false, errors.New("connection actively rejected by peer")
+
+		return false, errors.New(
+			"connection rejected by policy",
+		)
+
 	case ReadOnly:
+
 		if intent != "S2P_PULL" {
+
 			if p.Logger != nil {
-				p.Logger.Audit(fmt.Sprintf("%x", remoteIdentity[:8]), "HANDSHAKE_REJECTED", "Connection rejected: read-only policy strictly enforced against write intent")
+
+				p.Logger.Audit(
+					fmt.Sprintf("%x", remoteIdentity[:8]),
+					"HANDSHAKE_REJECTED",
+					"Read-only policy enforced",
+				)
 			}
-			return false, errors.New("connection rejected: read-only policy strictly enforced")
+
+			return false, errors.New(
+				"read-only access enforced",
+			)
 		}
+
 		return true, nil
+
 	case See:
 		return true, nil
+
 	default:
-		return false, errors.New("unknown access level")
+		return false, errors.New(
+			"unknown access level",
+		)
 	}
 }
 
-func (p *PeerRoute) PublishToSwarm(ctx context.Context, payload []byte) (NodeID, error) {
+func (p *PeerRoute) PublishToSwarm(
+	ctx context.Context,
+	payload []byte,
+) (NodeID, error) {
+
 	hash := sha256.Sum256(payload)
+
 	var objID NodeID
 	copy(objID[:], hash[:])
 
 	signature := p.auth.SignPayload(payload)
+
 	obj := SwarmObject{
 		ObjectID:  objID,
 		OwnerID:   p.localID,
@@ -145,104 +278,307 @@ func (p *PeerRoute) PublishToSwarm(ctx context.Context, payload []byte) (NodeID,
 	txn := p.db.BeginTxn()
 	defer p.db.CommitTxn(txn)
 
-	p.db.Write(CachePageID, txn, objID[:], objBytes, 72*time.Hour)
-	
-	if p.Logger != nil {
-		p.Logger.Info(fmt.Sprintf("Published object %x to swarm cache", objID[:8]))
+	err = p.db.Write(
+		CachePageID,
+		txn,
+		objID[:],
+		objBytes,
+		72*time.Hour,
+	)
+
+	if err != nil {
+
+		if p.Logger != nil {
+
+			p.Logger.Error(
+				fmt.Sprintf(
+					"Failed swarm publish: %v",
+					err,
+				),
+			)
+		}
+
+		return objID, err
 	}
-	
+
+	if p.Logger != nil {
+
+		p.Logger.Info(
+			fmt.Sprintf(
+				"Published object %x to swarm cache",
+				objID[:8],
+			),
+		)
+	}
+
+	go p.Broadcast(ctx, payload)
+
 	return objID, nil
 }
 
-func (p *PeerRoute) PullFromSwarm(ctx context.Context, objID NodeID) ([]byte, error) {
+func (p *PeerRoute) PullFromSwarm(
+	ctx context.Context,
+	objID NodeID,
+) ([]byte, error) {
+
 	txn := p.db.BeginTxn()
 	defer p.db.CommitTxn(txn)
 
-	valBytes, err := p.db.Read(CachePageID, txn, objID[:])
-	if err == nil && valBytes != nil {
-		var obj SwarmObject
-		json.Unmarshal(valBytes, &obj)
-		return obj.Payload, nil
-	}
-	return nil, errors.New("object not found in local cache")
-}
-
-func (p *PeerRoute) RevokeObject(ctx context.Context, objID NodeID) error {
-	txn := p.db.BeginTxn()
-	defer p.db.CommitTxn(txn)
-
-	err := p.db.Write(CachePageID, txn, objID[:], nil, time.Nanosecond)
-	if err == nil && p.Logger != nil {
-		p.Logger.Info(fmt.Sprintf("Revoked object %x from swarm cache", objID[:8]))
-	}
-	return err
-}
-
-func (p *PeerRoute) FindClosestNodes(targetID NodeID, count int) ([]RoutingEntry, error) {
-	txn := p.db.BeginTxn()
-	defer p.db.CommitTxn(txn)
-
-	prefix := []byte("dht_node:")
-	var closest []RoutingEntry
-
-	err := p.db.Scan(SystemPageID, txn, prefix, func(key, value []byte) bool {
-		var entry RoutingEntry
-		if err := json.Unmarshal(value, &entry); err == nil {
-			closest = append(closest, entry)
-		}
-		return true 
-	})
+	valBytes, err := p.db.Read(
+		CachePageID,
+		txn,
+		objID[:],
+	)
 
 	if err != nil {
 		return nil, err
 	}
 
-	for i := 0; i < len(closest)-1; i++ {
-		for j := i + 1; j < len(closest); j++ {
-			distI := xorDistance(closest[i].ID, targetID)
-			distJ := xorDistance(closest[j].ID, targetID)
-			if bytes.Compare(distI[:], distJ[:]) > 0 {
-				closest[i], closest[j] = closest[j], closest[i]
-			}
-		}
+	if valBytes == nil {
+		return nil, errors.New(
+			"object not found",
+		)
 	}
 
-	if len(closest) > count {
-		return closest[:count], nil
+	var obj SwarmObject
+
+	if err := json.Unmarshal(
+		valBytes,
+		&obj,
+	); err != nil {
+
+		return nil, err
 	}
-	return closest, nil
+
+	if p.Logger != nil {
+
+		p.Logger.Debug(
+			fmt.Sprintf(
+				"Pulled object %x from swarm cache",
+				objID[:8],
+			),
+		)
+	}
+
+	return obj.Payload, nil
 }
 
-func (p *PeerRoute) UpdateRoutingTable(remoteID NodeID, address string, dbscProof []byte) error {
-	isValid, err := p.auth.VerifyAddressClaim(remoteID[:], address, dbscProof)
-	if err != nil || !isValid {
-		if p.Logger != nil {
-			p.Logger.Audit(fmt.Sprintf("%x", remoteID[:8]), "ROUTING_REJECTED", "Hardware verification failed for address claim")
-		}
-		return errors.New("hardware verification failed")
-	}
-
-	entry := RoutingEntry{
-		ID:      remoteID,
-		Address: address,
-	}
-	valBytes, _ := json.Marshal(entry)
-	key := append([]byte("dht_node:"), remoteID[:]...)
+func (p *PeerRoute) RevokeObject(
+	ctx context.Context,
+	objID NodeID,
+) error {
 
 	txn := p.db.BeginTxn()
 	defer p.db.CommitTxn(txn)
 
-	err = p.db.Write(SystemPageID, txn, key, valBytes, 2*time.Hour)
-	if err == nil && p.Logger != nil {
-		p.Logger.Info(fmt.Sprintf("Routing table updated for node %x at %s", remoteID[:8], address))
+	err := p.db.Write(
+		CachePageID,
+		txn,
+		objID[:],
+		[]byte{},
+		time.Nanosecond,
+	)
+
+	if err != nil {
+
+		if p.Logger != nil {
+
+			p.Logger.Error(
+				fmt.Sprintf(
+					"Failed object revoke: %v",
+					err,
+				),
+			)
+		}
+
+		return err
 	}
-	return err
+
+	if p.Logger != nil {
+
+		p.Logger.Info(
+			fmt.Sprintf(
+				"Revoked object %x from swarm cache",
+				objID[:8],
+			),
+		)
+	}
+
+	return nil
 }
 
-func xorDistance(a, b NodeID) NodeID {
+func (p *PeerRoute) FindClosestNodes(
+	targetID NodeID,
+	count int,
+) ([]RoutingEntry, error) {
+
+	txn := p.db.BeginTxn()
+	defer p.db.CommitTxn(txn)
+
+	prefix := []byte("dht_node:")
+
+	closest := make([]RoutingEntry, 0)
+
+	err := p.db.Scan(
+		SystemPageID,
+		txn,
+		prefix,
+
+		func(key, value []byte) bool {
+
+			var entry RoutingEntry
+
+			if err := json.Unmarshal(
+				value,
+				&entry,
+			); err == nil {
+
+				closest = append(
+					closest,
+					entry,
+				)
+			}
+
+			return true
+		},
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	sort.Slice(
+		closest,
+		func(i, j int) bool {
+
+			distI := xorDistance(
+				closest[i].ID,
+				targetID,
+			)
+
+			distJ := xorDistance(
+				closest[j].ID,
+				targetID,
+			)
+
+			return bytes.Compare(
+				distI[:],
+				distJ[:],
+			) < 0
+		},
+	)
+
+	if len(closest) > count {
+		closest = closest[:count]
+	}
+
+	if p.Logger != nil {
+
+		p.Logger.Debug(
+			fmt.Sprintf(
+				"Located %d closest nodes",
+				len(closest),
+			),
+		)
+	}
+
+	return closest, nil
+}
+
+func (p *PeerRoute) UpdateRoutingTable(
+	remoteID NodeID,
+	address string,
+	dbscProof []byte,
+) error {
+
+	isValid, err := p.auth.VerifyAddressClaim(
+		remoteID[:],
+		address,
+		dbscProof,
+	)
+
+	if err != nil || !isValid {
+
+		if p.Logger != nil {
+
+			p.Logger.Audit(
+				fmt.Sprintf("%x", remoteID[:8]),
+				"ROUTING_REJECTED",
+				"Hardware verification failed",
+			)
+		}
+
+		return errors.New(
+			"hardware verification failed",
+		)
+	}
+
+	entry := RoutingEntry{
+		ID:        remoteID,
+		Address:   address,
+		UpdatedAt: time.Now(),
+	}
+
+	valBytes, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+
+	key := append(
+		[]byte("dht_node:"),
+		remoteID[:]...,
+	)
+
+	txn := p.db.BeginTxn()
+	defer p.db.CommitTxn(txn)
+
+	err = p.db.Write(
+		SystemPageID,
+		txn,
+		key,
+		valBytes,
+		2*time.Hour,
+	)
+
+	if err != nil {
+
+		if p.Logger != nil {
+
+			p.Logger.Error(
+				fmt.Sprintf(
+					"Failed routing update: %v",
+					err,
+				),
+			)
+		}
+
+		return err
+	}
+
+	if p.Logger != nil {
+
+		p.Logger.Info(
+			fmt.Sprintf(
+				"Routing updated for node %x (%s)",
+				remoteID[:8],
+				address,
+			),
+		)
+	}
+
+	return nil
+}
+
+func xorDistance(
+	a,
+	b NodeID,
+) NodeID {
+
 	var result NodeID
+
 	for i := 0; i < len(a); i++ {
 		result[i] = a[i] ^ b[i]
 	}
+
 	return result
 }
