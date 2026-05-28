@@ -2,6 +2,7 @@ package secure_network
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -88,16 +89,6 @@ func (pr *PeerRoute) RegisterHandler(
 	defer pr.mu.Unlock()
 
 	pr.handlers[route] = handler
-
-	if pr.Logger != nil {
-
-		pr.Logger.Debug(
-			fmt.Sprintf(
-				"PeerRoute handler registered: %s",
-				route,
-			),
-		)
-	}
 }
 
 func (pr *PeerRoute) Dispatch(
@@ -149,7 +140,54 @@ func (pr *PeerRoute) Broadcast(
 		ID: hex.EncodeToString(
 			hash[:],
 		),
-		Route:  route,
+		Route: route,
+		Payload: payload,
+		Origin: pr.meshNode.noisePub,
+		Timestamp: time.Now(),
+	}
+
+	raw, err := json.Marshal(
+		msg,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	return pr.meshNode.SendAction(
+		APIPayload{
+			Action: "rpc",
+			Content: string(raw),
+		},
+	)
+}
+
+func (pr *PeerRoute) SendToPeer(
+	ctx context.Context,
+	peerID []byte,
+	route string,
+	payload []byte,
+) error {
+
+	if pr.meshNode == nil {
+
+		return fmt.Errorf(
+			"mesh node unavailable",
+		)
+	}
+
+	hash := sha256.Sum256(
+		append(
+			peerID,
+			payload...,
+		),
+	)
+
+	msg := PeerMessage{
+		ID: hex.EncodeToString(
+			hash[:],
+		),
+		Route: route,
 		Payload: payload,
 		Origin: pr.meshNode.noisePub,
 		Timestamp: time.Now(),
@@ -186,16 +224,6 @@ func (pr *PeerRoute) HandleIngress(
 		return err
 	}
 
-	if pr.Logger != nil {
-
-		pr.Logger.Debug(
-			fmt.Sprintf(
-				"PeerRoute ingress route=%s",
-				msg.Route,
-			),
-		)
-	}
-
 	return pr.Dispatch(
 		ctx,
 		&msg,
@@ -214,16 +242,6 @@ func (pr *PeerRoute) AddPeer(
 	)
 
 	pr.peers[key] = peer
-
-	if pr.Logger != nil {
-
-		pr.Logger.Info(
-			fmt.Sprintf(
-				"Peer added: %s",
-				key[:12],
-			),
-		)
-	}
 }
 
 func (pr *PeerRoute) RemovePeer(
@@ -241,16 +259,6 @@ func (pr *PeerRoute) RemovePeer(
 		pr.peers,
 		key,
 	)
-
-	if pr.Logger != nil {
-
-		pr.Logger.Info(
-			fmt.Sprintf(
-				"Peer removed: %s",
-				key[:12],
-			),
-		)
-	}
 }
 
 func (pr *PeerRoute) ListPeers() []*PeerIdentity {
@@ -265,6 +273,7 @@ func (pr *PeerRoute) ListPeers() []*PeerIdentity {
 	)
 
 	for _, peer := range pr.peers {
+
 		out = append(
 			out,
 			peer,
@@ -283,17 +292,6 @@ func (pr *PeerRoute) SetAccessPolicy(
 	defer pr.mu.Unlock()
 
 	pr.accessPolicies[nodeID] = policy
-
-	if pr.Logger != nil {
-
-		pr.Logger.Debug(
-			fmt.Sprintf(
-				"Access policy updated for %x -> %d",
-				nodeID[:4],
-				policy,
-			),
-		)
-	}
 }
 
 func (pr *PeerRoute) EvaluateSwarmHandshake(
@@ -425,4 +423,33 @@ func (pr *PeerRoute) PeerCount() int {
 	return len(
 		pr.peers,
 	)
+}
+
+func (pr *PeerRoute) SignMessage(
+	serviceID string,
+	payload []byte,
+	priv ed25519.PrivateKey,
+) ([]byte, error) {
+
+	if len(priv) == 0 {
+
+		return nil,
+			fmt.Errorf(
+				"missing private key",
+			)
+	}
+
+	hash := sha256.Sum256(
+		append(
+			[]byte(serviceID),
+			payload...,
+		),
+	)
+
+	sig := ed25519.Sign(
+		priv,
+		hash[:],
+	)
+
+	return sig, nil
 }
