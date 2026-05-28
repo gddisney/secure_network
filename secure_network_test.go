@@ -131,22 +131,11 @@ func TestGossipIngress(
 	t *testing.T,
 ) {
 
-	db := &ultimate_db.DB{}
-
-	logDisp, _ := logger.NewLogDispatcher(
-		"gossip_test",
-		db,
-		ConfigPageID,
-		100,
-	)
-
-	peerRoute := &PeerRoute{}
-
 	gossip := NewGossipManager(
-		db,
-		peerRoute,
 		nil,
-		logDisp,
+		&PeerRoute{},
+		nil,
+		nil,
 	)
 
 	payload := []byte(`{
@@ -170,7 +159,6 @@ func TestGossipIngress(
 		)
 	}
 }
-
 func TestWebAuthnProvider(
 	t *testing.T,
 ) {
