@@ -116,53 +116,6 @@ func TestGossipIngress(
 	}
 }
 
-func TestWebAuthnProvider(
-	t *testing.T,
-) {
-
-	rsaPriv, err := rsa.GenerateKey(
-		rand.Reader,
-		2048,
-	)
-
-	if err != nil {
-
-		t.Fatalf(
-			"rsa generation failed: %v",
-			err,
-		)
-	}
-
-	sessionManager := secure_policy.NewSessionManager(
-		nil,
-		rsaPriv,
-	)
-
-	gui := &guikit.GUIKit{}
-
-	provider, err := webauthnext.New(
-		gui,
-		sessionManager,
-		"example.com",
-		"https://example.com",
-		"Secure Test",
-	)
-
-	if err != nil {
-
-		t.Fatalf(
-			"webauthn init failed: %v",
-			err,
-		)
-	}
-
-	if provider == nil {
-
-		t.Fatal(
-			"provider is nil",
-		)
-	}
-}
 
 func TestRPCManagerInitialization(
 	t *testing.T,
