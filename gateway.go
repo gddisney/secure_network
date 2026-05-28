@@ -19,6 +19,8 @@ const (
 	IdentityPageID ultimate_db.PageID = 1
 	ContentPageID  ultimate_db.PageID = 2
 	StatsPageID    ultimate_db.PageID = 3
+
+	MaxFrameSize = 16 * 1024 * 1024
 )
 
 type Gateway struct {
@@ -53,7 +55,10 @@ func NewGateway(
 	}
 }
 
-func (g *Gateway) SetApplicationHandler(handler http.HandlerFunc) {
+func (g *Gateway) SetApplicationHandler(
+	handler http.HandlerFunc,
+) {
+
 	if g.router != nil {
 		g.router.Mux.Handle("/", handler)
 	}
@@ -78,7 +83,6 @@ func (g *Gateway) ListenAndServe(
 	return nil
 }
 
-// quic-go v0.4x+ compatible
 func (g *Gateway) HandleSecureStream(
 	conn quic.Conn,
 	stream *quic.Stream,
@@ -86,15 +90,17 @@ func (g *Gateway) HandleSecureStream(
 
 	defer stream.Close()
 
-	hs, err := noise.NewHandshakeState(noise.Config{
-		CipherSuite: g.cipher,
-		Pattern:     noise.HandshakeIK,
-		Initiator:   false,
-		StaticKeypair: noise.DHKey{
-			Private: g.sPriv,
-			Public:  g.sPub,
+	hs, err := noise.NewHandshakeState(
+		noise.Config{
+			CipherSuite: g.cipher,
+			Pattern:     noise.HandshakeIK,
+			Initiator:   false,
+			StaticKeypair: noise.DHKey{
+				Private: g.sPriv,
+				Public:  g.sPub,
+			},
 		},
-	})
+	)
 
 	if err != nil {
 
@@ -110,14 +116,31 @@ func (g *Gateway) HandleSecureStream(
 		return
 	}
 
-	buf := make([]byte, 4096)
+	// READ HANDSHAKE FRAME
+	frame, err := ReadFrame(
+		stream,
+		MaxFrameSize,
+	)
 
-	n, err := stream.Read(buf)
 	if err != nil {
+
+		if g.Logger != nil {
+			g.Logger.Error(
+				fmt.Sprintf(
+					"Gateway failed reading handshake frame: %v",
+					err,
+				),
+			)
+		}
+
 		return
 	}
 
-	_, _, _, err = hs.ReadMessage(nil, buf[:n])
+	_, _, _, err = hs.ReadMessage(
+		nil,
+		frame,
+	)
+
 	if err != nil {
 
 		if g.Logger != nil {
@@ -137,6 +160,7 @@ func (g *Gateway) HandleSecureStream(
 	if !g.isIdentityValid(remoteKey) {
 
 		if g.Logger != nil {
+
 			g.Logger.Audit(
 				"system_gateway",
 				"TUNNEL_REJECTED",
@@ -150,13 +174,41 @@ func (g *Gateway) HandleSecureStream(
 		return
 	}
 
-	respMsg, csSend, csRecv, err := hs.WriteMessage(nil, nil)
+	respMsg, csSend, csRecv, err := hs.WriteMessage(
+		nil,
+		nil,
+	)
+
 	if err != nil {
+
+		if g.Logger != nil {
+			g.Logger.Error(
+				fmt.Sprintf(
+					"Handshake response failed: %v",
+					err,
+				),
+			)
+		}
+
 		return
 	}
 
-	_, err = stream.Write(respMsg)
+	err = WriteFrame(
+		stream,
+		respMsg,
+	)
+
 	if err != nil {
+
+		if g.Logger != nil {
+			g.Logger.Error(
+				fmt.Sprintf(
+					"Failed writing handshake response: %v",
+					err,
+				),
+			)
+		}
+
 		return
 	}
 
@@ -189,30 +241,58 @@ func (g *Gateway) HandleSecureStream(
 
 	for {
 
-		n, err := stream.Read(buf)
+		frame, err := ReadFrame(
+			stream,
+			MaxFrameSize,
+		)
+
 		if err != nil {
+
+			if g.Logger != nil {
+				g.Logger.Error(
+					fmt.Sprintf(
+						"Secure stream closed: %v",
+						err,
+					),
+				)
+			}
+
 			break
 		}
 
 		decrypted, err := csRecv.Decrypt(
 			nil,
 			nil,
-			buf[:n],
+			frame,
 		)
 
 		if err != nil {
+
+			if g.Logger != nil {
+				g.Logger.Error(
+					fmt.Sprintf(
+						"Noise decrypt failed: %v",
+						err,
+					),
+				)
+			}
+
 			continue
 		}
 
 		var req APIPayload
 
-		if err := json.Unmarshal(decrypted, &req); err == nil {
+		if err := json.Unmarshal(
+			decrypted,
+			&req,
+		); err == nil {
 
 			if req.Action == "tunnel_bind" {
 
 				if mod, exists := g.router.Modules["mesh_tunnel"]; exists {
 
 					tunnelManager, ok := mod.(*TunnelManager)
+
 					if !ok {
 						continue
 					}
@@ -224,7 +304,8 @@ func (g *Gateway) HandleSecureStream(
 
 					if err != nil {
 
-						stream.Write(
+						_ = WriteFrame(
+							stream,
 							[]byte(
 								"HTTP/1.1 403 Forbidden\r\n\r\n",
 							),
@@ -236,13 +317,18 @@ func (g *Gateway) HandleSecureStream(
 			}
 		}
 
-		g.routeToAPI(remoteKey, decrypted)
+		g.routeToAPI(
+			remoteKey,
+			decrypted,
+		)
 	}
 
 	g.activeSessions.Delete(sessionID)
 }
 
-func (g *Gateway) isIdentityValid(pubKey []byte) bool {
+func (g *Gateway) isIdentityValid(
+	pubKey []byte,
+) bool {
 
 	return g.router.PolicyEngine.HasPermission(
 		pubKey,
@@ -257,7 +343,9 @@ func (g *Gateway) monitorHeartbeat(
 	stop <-chan struct{},
 ) {
 
-	ticker := time.NewTicker(2 * time.Minute)
+	ticker := time.NewTicker(
+		2 * time.Minute,
+	)
 
 	defer ticker.Stop()
 
@@ -291,6 +379,7 @@ func (g *Gateway) monitorHeartbeat(
 			challenge := make([]byte, 32)
 
 			_, err := rand.Read(challenge)
+
 			if err != nil {
 				continue
 			}
@@ -301,16 +390,26 @@ func (g *Gateway) monitorHeartbeat(
 			}
 
 			data, err := json.Marshal(payload)
+
 			if err != nil {
 				continue
 			}
 
-			enc, err := csSend.Encrypt(nil, nil, data)
+			enc, err := csSend.Encrypt(
+				nil,
+				nil,
+				data,
+			)
+
 			if err != nil {
 				continue
 			}
 
-			_, err = stream.Write(enc)
+			err = WriteFrame(
+				stream,
+				enc,
+			)
+
 			if err != nil {
 				return
 			}
@@ -323,7 +422,9 @@ func (g *Gateway) monitorHeartbeat(
 
 func (g *Gateway) ScrubbingCycle() {
 
-	ticker := time.NewTicker(24 * time.Hour)
+	ticker := time.NewTicker(
+		24 * time.Hour,
+	)
 
 	defer ticker.Stop()
 
@@ -345,6 +446,7 @@ func (g *Gateway) ScrubbingCycle() {
 		)
 
 		cursor, err := ultimate_db.NewBTreeCursor(tree)
+
 		if err != nil {
 			continue
 		}
@@ -352,6 +454,7 @@ func (g *Gateway) ScrubbingCycle() {
 		for {
 
 			key, val, err := cursor.Next()
+
 			if err != nil {
 				break
 			}
@@ -360,7 +463,10 @@ func (g *Gateway) ScrubbingCycle() {
 				Signer []byte `json:"signer"`
 			}
 
-			if err := json.Unmarshal(val, &meta); err != nil {
+			if err := json.Unmarshal(
+				val,
+				&meta,
+			); err != nil {
 				continue
 			}
 
@@ -419,7 +525,10 @@ func (g *Gateway) routeToAPI(
 
 	var req APIPayload
 
-	if err := json.Unmarshal(payload, &req); err != nil {
+	if err := json.Unmarshal(
+		payload,
+		&req,
+	); err != nil {
 
 		if g.Logger != nil {
 
@@ -494,6 +603,7 @@ func (g *Gateway) routeToAPI(
 		}
 
 		val, err := json.Marshal(meta)
+
 		if err != nil {
 			return
 		}
@@ -537,6 +647,7 @@ func (g *Gateway) routeToAPI(
 		}
 
 		val, err := json.Marshal(meta)
+
 		if err != nil {
 			return
 		}
@@ -574,7 +685,10 @@ func (g *Gateway) routeToAPI(
 
 		rpcPayload["signer"] = signer
 
-		enrichedPayload, err := json.Marshal(rpcPayload)
+		enrichedPayload, err := json.Marshal(
+			rpcPayload,
+		)
+
 		if err != nil {
 			return
 		}
