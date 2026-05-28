@@ -7,12 +7,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gddisney/guikit"
 	"github.com/gddisney/logger"
 	"github.com/gddisney/secure_policy"
 	"github.com/gddisney/service_keys"
 	"github.com/gddisney/ultimate_db"
 	"github.com/gddisney/webauthnext"
-	"github.com/gddisney/guikit"
 )
 
 func createTestNode(
@@ -30,6 +30,7 @@ func createTestNode(
 	)
 
 	if err != nil {
+
 		t.Fatalf(
 			"failed creating logger: %v",
 			err,
@@ -46,6 +47,7 @@ func createTestNode(
 	)
 
 	if err != nil {
+
 		t.Fatalf(
 			"failed creating secure node: %v",
 			err,
@@ -140,16 +142,10 @@ func TestGossipIngress(
 
 	peerRoute := &PeerRoute{}
 
-	skm := service_keys.NewServiceKeyManager(
-		db,
-		nil,
-		logDisp,
-	)
-
 	gossip := NewGossipManager(
 		db,
 		peerRoute,
-		skm,
+		nil,
 		logDisp,
 	)
 
@@ -166,10 +162,11 @@ func TestGossipIngress(
 		payload,
 	)
 
-	if err == nil {
+	if err != nil {
 
-		t.Log(
-			"gossip ingress executed",
+		t.Fatalf(
+			"gossip ingress failed: %v",
+			err,
 		)
 	}
 }
@@ -224,42 +221,19 @@ func TestWebAuthnProvider(
 	}
 }
 
-func TestSecureNodeInitialization(
+func TestRPCManagerInitialization(
 	t *testing.T,
 ) {
 
-	db := &ultimate_db.DB{}
-
-	node := createTestNode(
-		t,
-		db,
+	rpc := NewRPCManager(
+		&PeerRoute{},
+		nil,
 	)
 
-	if node == nil {
+	if rpc == nil {
 
 		t.Fatal(
-			"node is nil",
-		)
-	}
-
-	if node.Mesh == nil {
-
-		t.Fatal(
-			"mesh subsystem missing",
-		)
-	}
-
-	if node.RPC == nil {
-
-		t.Fatal(
-			"rpc subsystem missing",
-		)
-	}
-
-	if node.Gossip == nil {
-
-		t.Fatal(
-			"gossip subsystem missing",
+			"rpc manager is nil",
 		)
 	}
 }
@@ -268,16 +242,14 @@ func TestRPCRegistration(
 	t *testing.T,
 ) {
 
-	db := &ultimate_db.DB{}
-
-	node := createTestNode(
-		t,
-		db,
+	rpc := NewRPCManager(
+		&PeerRoute{},
+		nil,
 	)
 
 	called := false
 
-	node.RegisterRPC(
+	rpc.Register(
 		"ping",
 		func(
 			ctx context.Context,
@@ -290,7 +262,7 @@ func TestRPCRegistration(
 		},
 	)
 
-	handler, ok := node.RPC.handlers["ping"]
+	handler, ok := rpc.handlers["ping"]
 
 	if !ok {
 
@@ -299,7 +271,7 @@ func TestRPCRegistration(
 		)
 	}
 
-	_, err := handler(
+	resp, err := handler(
 		context.Background(),
 		[]byte("hello"),
 	)
@@ -309,6 +281,13 @@ func TestRPCRegistration(
 		t.Fatalf(
 			"handler execution failed: %v",
 			err,
+		)
+	}
+
+	if string(resp) != "pong" {
+
+		t.Fatal(
+			"unexpected response",
 		)
 	}
 
@@ -324,16 +303,16 @@ func TestGossipRegistration(
 	t *testing.T,
 ) {
 
-	db := &ultimate_db.DB{}
-
-	node := createTestNode(
-		t,
-		db,
+	gossip := NewGossipManager(
+		&ultimate_db.DB{},
+		&PeerRoute{},
+		nil,
+		nil,
 	)
 
 	called := false
 
-	node.RegisterGossip(
+	gossip.RegisterHandler(
 		"test-service",
 		func(
 			ctx context.Context,
@@ -345,7 +324,7 @@ func TestGossipRegistration(
 		},
 	)
 
-	handler, ok := node.Gossip.handlers["test-service"]
+	handler, ok := gossip.handlers["test-service"]
 
 	if !ok {
 
@@ -379,12 +358,7 @@ func TestPeerRouteLifecycle(
 	t *testing.T,
 ) {
 
-	db := &ultimate_db.DB{}
-
-	node := createTestNode(
-		t,
-		db,
-	)
+	peerRoute := &PeerRoute{}
 
 	var nodeID NodeID
 
@@ -400,22 +374,22 @@ func TestPeerRouteLifecycle(
 		LastSeen:  time.Now(),
 	}
 
-	node.PeerRoute.AddPeer(
+	peerRoute.AddPeer(
 		peer,
 	)
 
-	if node.PeerRoute.PeerCount() != 1 {
+	if peerRoute.PeerCount() != 1 {
 
 		t.Fatal(
 			"peer count mismatch",
 		)
 	}
 
-	node.PeerRoute.RemovePeer(
+	peerRoute.RemovePeer(
 		nodeID,
 	)
 
-	if node.PeerRoute.PeerCount() != 0 {
+	if peerRoute.PeerCount() != 0 {
 
 		t.Fatal(
 			"peer removal failed",
