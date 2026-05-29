@@ -394,3 +394,13 @@ func (m *RPCManager) handleIngress(
 		)
 	}
 }
+
+// RPCContext is the struct requested by identity_provider
+type RPCContext struct {
+	Ctx context.Context
+}
+
+// Init now satisfies the secure_network.Module interface
+func (m *RPCManager) Init(router *Router) error {
+	return nil
+}
