@@ -21,10 +21,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gddisney/guikit"
-	"github.com/gddisney/logger"
-	"github.com/gddisney/secure_policy"
-	"github.com/gddisney/ultimate_db"
+	"github.com/0TrustCloud/guikit"
+	"github.com/0TrustCloud/logger"
+	"github.com/0TrustCloud/secure_policy"
+	"github.com/0TrustCloud/ultimate_db"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
