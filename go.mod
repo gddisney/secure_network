@@ -1,4 +1,4 @@
-module github.com/gddisney/secure_network
+module github.com/0TrustCloud/secure_network
 
 go 1.25.10
 
