@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gddisney/logger"
-	"github.com/gddisney/service_keys"
-	"github.com/gddisney/ultimate_db"
+	"github.com/0TrustCloud/logger"
+	"github.com/0TrustCloud/service_keys"
+	"github.com/0TrustCloud/ultimate_db"
 )
 
 type GossipEnvelope struct {
