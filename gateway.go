@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/flynn/noise"
-	"github.com/gddisney/logger"
-	"github.com/gddisney/ultimate_db"
+	"github.com/0TrustCloud/logger"
+	"github.com/0TrustCloud/ultimate_db"
 	"github.com/quic-go/quic-go"
 )
 
