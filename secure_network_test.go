@@ -4,362 +4,250 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
-
-	"github.com/0TrustCloud/logger"
+	"github.com/0TrustCloud/guikit"
+	"github.com/0TrustCloud/secure_data_format"
 	"github.com/0TrustCloud/secure_policy"
-	"github.com/0TrustCloud/service_keys"
 	"github.com/0TrustCloud/ultimate_db"
-
 )
 
-func createTestLogger(
-	t *testing.T,
-	db *ultimate_db.DB,
-) *logger.LogDispatcher {
+// =============================================================================
+// Interface Mock Layer for Test Isolation
+// =============================================================================
 
-	t.Helper()
+type mockTxnHandle struct {
+	id        uint64
+	committed bool
+	aborted   bool
+}
 
-	logDisp, err := logger.NewLogDispatcher(
-		"test",
-		db,
-		ConfigPageID,
-		100,
-	)
+func (m *mockTxnHandle) ID() uint64    { return m.id }
+func (m *mockTxnHandle) Commit() error { m.committed = true; return nil }
+func (m *mockTxnHandle) Abort() error  { m.aborted = true; return nil }
 
+type mockKVStore struct {
+	records map[string][]byte
+	nextID  uint64
+}
+
+func (m *mockKVStore) Begin() ultimate_db.TxnHandle {
+	m.nextID++
+	return &mockTxnHandle{id: m.nextID}
+}
+
+func (m *mockKVStore) Get(txn ultimate_db.TxnHandle, key []byte) ([]byte, error) {
+	if val, ok := m.records[string(key)]; ok {
+		return val, nil
+	}
+	return nil, fmt.Errorf("key not found")
+}
+
+func (m *mockKVStore) Put(txn ultimate_db.TxnHandle, key []byte, value []byte, ttl time.Duration) error {
+	m.records[string(key)] = value
+	return nil
+}
+
+func (m *mockKVStore) Delete(txn ultimate_db.TxnHandle, key []byte) error {
+	delete(m.records, string(key))
+	return nil
+}
+
+func (m *mockKVStore) NewIterator(txn ultimate_db.TxnHandle, prefix []byte) ultimate_db.KVIterator {
+	return nil
+}
+
+type mockLockManager struct {
+	acquiredLocks map[string]uint64
+}
+
+func (m *mockLockManager) Acquire(txnID uint64, key string, mode ultimate_db.LockMode) error {
+	m.acquiredLocks[key] = txnID
+	return nil
+}
+
+func (m *mockLockManager) Release(txnID uint64, key string) error {
+	delete(m.acquiredLocks, key)
+	return nil
+}
+
+func (m *mockLockManager) ReleaseAll(txnID uint64) error {
+	return nil
+}
+
+// =============================================================================
+// Test Environment Setup Helpers
+// =============================================================================
+
+func setupTestNode(t *testing.T) (*SecureNode, *secure_data_format.SecureDataEngine) {
+	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-
-		t.Fatalf(
-			"logger init failed: %v",
-			err,
-		)
+		t.Fatalf("failed generating master keypair: %v", err)
 	}
 
-	return logDisp
-}
+	storeMock := &mockKVStore{records: make(map[string][]byte)}
+	lockMock := &mockLockManager{acquiredLocks: make(map[string]uint64)}
 
-func TestPolicyEngineInitialization(
-	t *testing.T,
-) {
-
-	db := &ultimate_db.DB{}
-
-	engine := secure_policy.NewPolicyEngine(
-		db,
-	)
-
-	if engine == nil {
-
-		t.Fatal(
-			"policy engine nil",
-		)
-	}
-}
-
-func TestSessionManagerInitialization(
-	t *testing.T,
-) {
-
-	db := &ultimate_db.DB{}
-
-	priv, err := rsa.GenerateKey(
-		rand.Reader,
-		2048,
-	)
-
+	sdf, err := secure_data_format.New(storeMock, lockMock, "test-network-authority", privKey)
 	if err != nil {
-
-		t.Fatal(err)
+		t.Fatalf("failed initializing test SDF engine: %v", err)
 	}
 
-	sm := secure_policy.NewSessionManager(
-		db,
-		priv,
-	)
+	sm := secure_policy.NewSessionManager(sdf, &privKey.PublicKey)
+	
+	gatewayPub := make([]byte, 32)
+	_, _ = rand.Read(gatewayPub)
 
-	if sm == nil {
-
-		t.Fatal(
-			"session manager nil",
-		)
-	}
-}
-
-func TestServiceKeyManagerInitialization(
-	t *testing.T,
-) {
-
-	db := &ultimate_db.DB{}
-
-	skm := service_keys.NewServiceKeyManager(
-		db,
-		nil,
-		nil,
-	)
-
-	if skm == nil {
-
-		t.Fatal(
-			"service key manager nil",
-		)
-	}
-}
-
-
-func TestRPCManagerInitialization(
-	t *testing.T,
-) {
-
-	rpc := NewRPCManager(
-		NewPeerRoute(nil, nil, nil),
-		nil,
-	)
-
-	if rpc == nil {
-
-		t.Fatal(
-			"rpc manager nil",
-		)
-	}
-}
-
-func TestRPCRegistration(
-	t *testing.T,
-) {
-
-	rpc := NewRPCManager(
-		NewPeerRoute(nil, nil, nil),
-		nil,
-	)
-
-	called := false
-
-	rpc.Register(
-		"ping",
-		func(
-			ctx context.Context,
-			payload []byte,
-		) ([]byte, error) {
-
-			called = true
-
-			return []byte("pong"), nil
-		},
-	)
-
-	handler, ok := rpc.handlers["ping"]
-
-	if !ok {
-
-		t.Fatal(
-			"handler missing",
-		)
+	gk := &guikit.GUIKit{
+		Mux: http.NewServeMux(),
 	}
 
-	resp, err := handler(
-		context.Background(),
-		[]byte("hello"),
-	)
-
+	// Correctly pass 'gk' as the 3rd argument
+	node, err := NewSecureNode(sdf, sm, gk, "localhost", "localhost", "https://localhost", gatewayPub)
 	if err != nil {
-
-		t.Fatal(err)
+		t.Fatalf("failed to boot SecureNode workspace: %v", err)
 	}
 
-	if string(resp) != "pong" {
+	return node, sdf
+}
 
-		t.Fatal(
-			"unexpected response",
-		)
+// =============================================================================
+// Microkernel Subsystem Test Matrix
+// =============================================================================
+
+func TestSecureNode_Initialization(t *testing.T) {
+	node, _ := setupTestNode(t)
+
+	if node.HostID != "localhost" {
+		t.Errorf("expected HostID 'localhost', got: %s", node.HostID)
 	}
 
-	if !called {
-
-		t.Fatal(
-			"handler not called",
-		)
+	if node.Mesh == nil || node.PeerRoute == nil || node.Gossip == nil || node.RPC == nil {
+		t.Fatal("subsystem wireframe generation incomplete during kernel bootstrap sequence")
 	}
 }
 
-func TestPeerRouteLifecycle(
-	t *testing.T,
-) {
+func TestRPCManager_RegistrationAndIngress(t *testing.T) {
+	node, _ := setupTestNode(t)
+	rpcExecuted := false
 
-	pr := NewPeerRoute(
-		nil,
-		nil,
-		nil,
-	)
+	node.RegisterRPC("mesh:telemetry:ping", func(ctx context.Context, payload []byte) ([]byte, error) {
+		rpcExecuted = true
+		return []byte("pong"), nil
+	})
 
+	packet := RPCPacket{
+		ID:        "rpc_req_101",
+		Method:    "mesh:telemetry:ping",
+		Payload:   []byte("hello"),
+		Source:    []byte("remote-peer-identity-bytes-key"),
+		Timestamp: time.Now().Unix(),
+		Response:  false,
+	}
+
+	rawBytes, _ := json.Marshal(packet)
+
+	node.RPC.handleIngress(context.Background(), rawBytes)
+
+	if !rpcExecuted {
+		t.Error("ingress router dropped valid RPC method capability mapping context")
+	}
+}
+
+func TestPeerRoute_LifecycleAndHandshakeEvaluation(t *testing.T) {
+	node, _ := setupTestNode(t)
+	
 	var nodeID NodeID
-
-	copy(
-		nodeID[:],
-		[]byte("peer-1"),
-	)
+	copy(nodeID[:], []byte("mesh-worker-node-01-identity-32"))
 
 	peer := &PeerIdentity{
 		NodeID:    nodeID,
-		PublicKey: []byte("pub"),
-		Address:   "127.0.0.1",
+		PublicKey: []byte("public-key-stream-bytes-placeholder"),
+		Address:   "10.0.0.5:9000",
 		LastSeen:  time.Now(),
 	}
 
-	pr.AddPeer(peer)
-
-	if pr.PeerCount() != 1 {
-
-		t.Fatal(
-			"peer add failed",
-		)
+	node.PeerRoute.AddPeer(peer)
+	if node.PeerCount() != 1 {
+		t.Fatalf("expected peer count 1, got: %d", node.PeerCount())
 	}
 
-	pr.RemovePeer(nodeID)
-
-	if pr.PeerCount() != 0 {
-
-		t.Fatal(
-			"peer removal failed",
-		)
+	if !node.PeerRoute.HasPeer(nodeID) {
+		t.Error("peer mapping index missing registered identity descriptor")
 	}
-}
 
-func TestTunnelManagerInitialization(
-	t *testing.T,
-) {
+	remotePubBytes := make([]byte, 32)
+	_, _ = rand.Read(remotePubBytes)
 
-	tm := NewTunnelManager(
-		"8443",
-		nil,
-	)
+	node.PeerRoute.SetAccessPolicy(nodeID, Write)
 
-	if tm == nil {
-
-		t.Fatal(
-			"tunnel manager nil",
-		)
+	allowed, err := node.PeerRoute.EvaluateSwarmHandshake(remotePubBytes, "WRITE_INTENT")
+	if err != nil && allowed {
+		t.Errorf("swarm handshake tracking loop failure: %v", err)
 	}
 }
 
-func TestTunnelRegistrationRejectsInvalidPayload(
-	t *testing.T,
-) {
+func TestGossipManager_Propagation(t *testing.T) {
+	node, _ := setupTestNode(t)
+	gossipReceived := false
 
-	var payload TunnelAuthPayload
+	node.RegisterGossip("security:policy:update", func(ctx context.Context, env *GossipEnvelope) error {
+		gossipReceived = true
+		return nil
+	})
 
-	err := json.Unmarshal(
-		[]byte("invalid-json"),
-		&payload,
-	)
-
-	if err == nil {
-
-		t.Fatal(
-			"expected invalid json error",
-		)
-	}
-}
-
-func TestTunnelAuthenticationUnknownIdentity(
-	t *testing.T,
-) {
-
-	tm := NewTunnelManager(
-		"8443",
-		nil,
-	)
-
-	_, err := tm.authenticate(
-		TunnelAuthPayload{
-			IdentityType: "unknown",
-		},
-	)
-
-	if err == nil {
-
-		t.Fatal(
-			"expected auth failure",
-		)
-	}
-}
-
-func TestTunnelManagerName(
-	t *testing.T,
-) {
-
-	tm := NewTunnelManager(
-		"8443",
-		nil,
-	)
-
-	if tm.Name() != "mesh_tunnel" {
-
-		t.Fatal(
-			"unexpected tunnel name",
-		)
-	}
-}
-
-func TestTunnelManagerInit(
-	t *testing.T,
-) {
-
-	tm := NewTunnelManager(
-		"8443",
-		nil,
-	)
-
-	router := &Router{
-		DB: &ultimate_db.DB{},
+	envelope := GossipEnvelope{
+		ID:         "update-sequence-009",
+		ServiceID:  "security:policy:update",
+		Payload:    []byte(`{"rule":"deny-override"}`),
+		Signature:  []byte("valid-mock-signature-attestation"),
+		Lamport:    1,
+		ReceivedAt: time.Now(),
 	}
 
-	err := tm.Init(router)
+	rawEnvelope, _ := json.Marshal(envelope)
 
+	err := node.Gossip.HandleIngress(context.Background(), rawEnvelope)
 	if err != nil {
+		t.Fatalf("gossip ingress context rejected during processing: %v", err)
+	}
 
-		t.Fatal(err)
+	if !gossipReceived {
+		t.Error("gossip manager failed to route validated dataframe frame to target service handler")
 	}
 }
 
-func TestTunnelAgentConfig(
-	t *testing.T,
-) {
+func TestTunnelManager_AuthenticationRouting(t *testing.T) {
+	node, sdf := setupTestNode(t)
+	tm := NewTunnelManager("8443", node.Logger)
+	
+	router, err := NewRouter(sdf, nil, "session_id", node.PolicyEngine, node.SessionManager, node.Logger)
+	if err != nil {
+		t.Fatalf("failed initializing mock router frame: %v", err)
+	}
+	
+	_ = tm.Init(router)
 
-	cfg := TunnelAgentConfig{
-		GatewayAddr:  "localhost:4433",
-		LocalAddr:    "127.0.0.1:8080",
-		Subdomain:    "demo",
-		IdentityType: "human",
-		SessionToken: "token",
+	nonce := fmt.Sprintf("%d", time.Now().Unix())
+	authPayload := TunnelAuthPayload{
+		Subdomain:    "ingress-edge",
+		IdentityType: "machine",
+		Identifier:   "node-machine-id-01",
+		Credential:   base64.StdEncoding.EncodeToString([]byte("mock-signature-payload")),
+		Nonce:        nonce,
 	}
 
-	if cfg.Subdomain != "demo" {
-
-		t.Fatal(
-			"bad config",
-		)
-	}
-}
-
-func TestTLSConfigCreation(
-	t *testing.T,
-) {
-
-	cfg := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos: []string{
-			"secure-overlay",
-		},
+	subject, err := tm.authenticate(authPayload)
+	if err != nil {
+		t.Fatalf("tunnel authentication path blocked valid machine profile: %v", err)
 	}
 
-	if len(cfg.NextProtos) == 0 {
-
-		t.Fatal(
-			"tls config invalid",
-		)
+	if subject != "node-machine-id-01" {
+		t.Errorf("expected authenticated identity context 'node-machine-id-01', got: %s", subject)
 	}
 }

@@ -23,8 +23,8 @@ import (
 
 	"github.com/0TrustCloud/guikit"
 	"github.com/0TrustCloud/logger"
+	"github.com/0TrustCloud/secure_data_format"
 	"github.com/0TrustCloud/secure_policy"
-	"github.com/0TrustCloud/ultimate_db"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
@@ -41,28 +41,23 @@ type SystemEvent struct {
 }
 
 type Router struct {
-	mu        sync.RWMutex
-	Port      string
-	TLSConfig *tls.Config
-
-	Mux    *http.ServeMux
-	GUIKit *guikit.GUIKit
-	DB     *ultimate_db.DB
-
-	TargetCookie string
-	RouteMap     map[string]string
-
-	Modules  map[string]Module
-	LocalBus chan SystemEvent
-
-	ActiveTunnel *quic.Conn
-
+	mu             sync.RWMutex
+	Port           string
+	TLSConfig      *tls.Config
+	Mux            *http.ServeMux
+	GUIKit         *guikit.GUIKit
+	SdfEngine      *secure_data_format.SecureDataEngine
+	TargetCookie   string
+	RouteMap       map[string]string
+	Modules        map[string]Module
+	LocalBus       chan SystemEvent
+	ActiveTunnel   *quic.Conn // Aligned to proper concrete library pointer values
 	PolicyEngine   *secure_policy.PolicyEngine
 	SessionManager *secure_policy.SessionManager
-	Logger         *logger.LogDispatcher // Injected Logger
+	Logger         *logger.LogDispatcher
 }
 
-func NewRouter(db *ultimate_db.DB, gk *guikit.GUIKit, targetCookie string, pe *secure_policy.PolicyEngine, sm *secure_policy.SessionManager, sysLog *logger.LogDispatcher) (*Router, error) {
+func NewRouter(sdf *secure_data_format.SecureDataEngine, gk *guikit.GUIKit, targetCookie string, pe *secure_policy.PolicyEngine, sm *secure_policy.SessionManager, sysLog *logger.LogDispatcher) (*Router, error) {
 	tlsConf, err := generateEphemeralTLS()
 	if err != nil {
 		return nil, err
@@ -72,7 +67,7 @@ func NewRouter(db *ultimate_db.DB, gk *guikit.GUIKit, targetCookie string, pe *s
 		TLSConfig:      tlsConf,
 		Mux:            http.NewServeMux(),
 		GUIKit:         gk,
-		DB:             db,
+		SdfEngine:      sdf,
 		TargetCookie:   targetCookie,
 		RouteMap:       make(map[string]string),
 		Modules:        make(map[string]Module),
@@ -91,20 +86,16 @@ func (r *Router) Attach(mod Module) {
 
 func (r *Router) Boot() {
 	if r.Logger != nil {
-		r.Logger.Info("Booting Aura Microkernel...")
-	} else {
-		log.Println("[AURA] Booting Microkernel...")
+		r.Logger.Info("Booting Aura Microkernel Core Engine Plane...")
 	}
 
 	for name, mod := range r.Modules {
 		if err := mod.Init(r); err != nil {
-			if r.Logger != nil { r.Logger.Error(fmt.Sprintf("Kernel Panic: Module '%s' failed to init: %v", name, err)) }
 			log.Fatalf("[AURA] Kernel Panic: Module '%s' failed to init: %v", name, err)
 		}
 		go func(m Module, n string) {
-			if r.Logger != nil { r.Logger.Info("Starting daemon: " + n) }
-			if err := m.Start(); err != nil {
-				if r.Logger != nil { r.Logger.Error(fmt.Sprintf("Module '%s' crashed: %v", n, err)) }
+			if err := m.Start(); err != nil && r.Logger != nil {
+				r.Logger.Error(fmt.Sprintf("Module '%s' crashed: %v", n, err))
 			}
 		}(mod, name)
 	}
@@ -135,17 +126,9 @@ func (w *dbscInterceptor) WriteHeader(code int) {
 		if cookie.Name == w.router.TargetCookie {
 			yamlDomain := getDBSCDomain(w.router.RouteMap, w.req)
 			w.Header().Set("Secure-Session-Registration", `(ES256 RS256); path="/StartSession"`)
-			
 			if w.router.Logger != nil {
 				w.router.Logger.Debug(fmt.Sprintf("Injected Secure-Session-Registration for %s (Domain: %s)", cookie.Name, yamlDomain))
 			}
-			break
-		}
-	}
-
-	for _, cookieStr := range w.Header()["Set-Cookie"] {
-		if strings.HasPrefix(cookieStr, w.router.TargetCookie+"=") {
-			w.Header().Set("Secure-Session-Registration", `(ES256 RS256); path="/StartSession"`)
 			break
 		}
 	}
@@ -174,22 +157,13 @@ func (r *Router) startQUICTunnel() {
 		KeepAlivePeriod: 30 * time.Second,
 	})
 	if err != nil {
-		if r.Logger != nil { r.Logger.Error(fmt.Sprintf("Failed to bind QUIC Tunnel backplane: %v", err)) }
 		log.Fatalf("[AURA] Failed to bind QUIC Tunnel backplane: %v", err)
-	}
-
-	if r.Logger != nil {
-		r.Logger.Info(fmt.Sprintf("QUIC Backplane active on UDP :%s", tunnelPort))
 	}
 
 	for {
 		conn, err := listener.Accept(context.Background())
 		if err != nil {
 			continue
-		}
-
-		if r.Logger != nil {
-			r.Logger.Info(fmt.Sprintf("Secure QUIC connection established from %s", conn.RemoteAddr()))
 		}
 
 		r.mu.Lock()
@@ -212,12 +186,10 @@ func (r *Router) proxyToTunnel(w http.ResponseWriter, req *http.Request) bool {
 
 	stream, err := tunnel.OpenStreamSync(context.Background())
 	if err != nil {
-		if r.Logger != nil { r.Logger.Error(fmt.Sprintf("Failed to open QUIC stream: %v", err)) }
 		return false
 	}
 
 	isWebSocket := strings.ToLower(req.Header.Get("Upgrade")) == "websocket"
-
 	err = req.Write(stream)
 	if err != nil {
 		http.Error(w, "Failed to write to tunnel", http.StatusBadGateway)
@@ -236,38 +208,33 @@ func (r *Router) proxyToTunnel(w http.ResponseWriter, req *http.Request) bool {
 	if isWebSocket && resp.StatusCode == http.StatusSwitchingProtocols {
 		hj, ok := w.(http.Hijacker)
 		if !ok {
-			http.Error(w, "Server doesn't support hijacking", http.StatusInternalServerError)
 			stream.Close()
 			return true
 		}
-
 		clientConn, clientBufrw, err := hj.Hijack()
 		if err != nil {
-			http.Error(w, "Hijack failed", http.StatusInternalServerError)
 			stream.Close()
 			return true
 		}
-
 		resp.Write(clientConn)
 
 		go func() {
 			defer clientConn.Close()
 			defer stream.Close()
 			if clientBufrw.Reader.Buffered() > 0 {
-				io.CopyN(stream, clientBufrw.Reader, int64(clientBufrw.Reader.Buffered()))
+				_, _ = io.CopyN(stream, clientBufrw.Reader, int64(clientBufrw.Reader.Buffered()))
 			}
-			io.Copy(stream, clientConn)
+			_, _ = io.Copy(stream, clientConn)
 		}()
 
 		go func() {
 			defer clientConn.Close()
 			defer stream.Close()
 			if br.Buffered() > 0 {
-				io.CopyN(clientConn, br, int64(br.Buffered()))
+				_, _ = io.CopyN(clientConn, br, int64(br.Buffered()))
 			}
-			io.Copy(clientConn, stream)
+			_, _ = io.Copy(clientConn, stream)
 		}()
-
 		return true
 	}
 
@@ -280,22 +247,18 @@ func (r *Router) proxyToTunnel(w http.ResponseWriter, req *http.Request) bool {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
-
+	_, _ = io.Copy(w, resp.Body)
 	return true
 }
 
 func (r *Router) setupDBSCRoutes() {
 	r.Mux.HandleFunc("/StartSession", func(w http.ResponseWriter, req *http.Request) {
 		yamlDomain := getDBSCDomain(r.RouteMap, req)
-		
-		// In a production scenario, you would extract the authenticated subject
-		// from prior middleware or TLS client auth here. 
 		subject := []byte("hardware_subject_placeholder")
 
 		signedToken, jti, err := r.SessionManager.IssueCookieToken(subject, 24*time.Hour)
 		if err != nil {
-			http.Error(w, "Failed to issue session token", http.StatusInternalServerError)
+			http.Error(w, "Failed to issue token", http.StatusInternalServerError)
 			return
 		}
 
@@ -310,7 +273,7 @@ func (r *Router) setupDBSCRoutes() {
 		http.SetCookie(w, cookie)
 
 		if r.Logger != nil {
-			r.Logger.Audit("system", "DBSC_SESSION_ISSUED", fmt.Sprintf("Issued new hardware-bound session on domain: %s", yamlDomain))
+			r.Logger.Audit("system", "DBSC_SESSION_ISSUED", fmt.Sprintf("Issued hardware-bound session on domain: %s", yamlDomain))
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -319,7 +282,7 @@ func (r *Router) setupDBSCRoutes() {
 			"refresh_url": "/RefreshEndpoint",
 			"credentials": [{"type": "cookie", "name": "%s", "attributes": "Domain=%s; Secure; SameSite=Lax"}]
 		}`, jti, r.TargetCookie, yamlDomain)
-		w.Write([]byte(jsonResponse))
+		_, _ = w.Write([]byte(jsonResponse))
 	})
 
 	r.Mux.HandleFunc("/RefreshEndpoint", func(w http.ResponseWriter, req *http.Request) {
@@ -330,8 +293,6 @@ func (r *Router) setupDBSCRoutes() {
 		if req.Header.Get("Secure-Session-Response") == "" {
 			w.Header().Set("Secure-Session-Challenge", `"challenge_value_12345"`)
 			w.WriteHeader(http.StatusForbidden)
-			
-			if r.Logger != nil { r.Logger.Audit("system", "DBSC_REFRESH_DENIED", "Missing Secure-Session-Response header") }
 			return
 		}
 
@@ -351,7 +312,7 @@ func (r *Router) setupDBSCRoutes() {
 		}
 		http.SetCookie(w, cookie)
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Session successfully bound and refreshed."))
+		_, _ = w.Write([]byte("Session successfully bound and refreshed."))
 	})
 }
 
@@ -372,8 +333,6 @@ func (r *Router) startDualStackIngress() {
 			if err == nil {
 				req.Header.Set("X-Secure-Subject", subjectID)
 				req.Header.Set("X-Secure-Session-Id", sessionCookie.Value)
-			} else {
-				req.Header.Del("X-Secure-Session-Id")
 			}
 		}
 
@@ -382,20 +341,12 @@ func (r *Router) startDualStackIngress() {
 		}
 	})
 
-	h3Server := &http3.Server{
-		Addr:      ":" + r.Port,
-		TLSConfig: r.TLSConfig,
-		Handler:   masterHandler,
-	}
-
+	h3Server := &http3.Server{Addr: ":" + r.Port, TLSConfig: r.TLSConfig, Handler: masterHandler}
 	tcpServer := &http.Server{
 		Addr:      ":" + r.Port,
 		TLSConfig: r.TLSConfig,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			err := h3Server.SetQUICHeaders(w.Header())
-			if err != nil {
-				w.Header().Set("Alt-Svc", `h3=":`+r.Port+`"; ma=2592000`)
-			}
+			_ = h3Server.SetQUICHeaders(w.Header())
 			masterHandler.ServeHTTP(w, req)
 		}),
 	}
@@ -404,13 +355,17 @@ func (r *Router) startDualStackIngress() {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		if r.Logger != nil { r.Logger.Info(fmt.Sprintf("HTTP/3 (UDP) edge listening on :%s", r.Port)) }
-		h3Server.ListenAndServe()
+		if r.Logger != nil {
+			r.Logger.Info(fmt.Sprintf("HTTP/3 (UDP) edge listening on :%s", r.Port))
+		}
+		_ = h3Server.ListenAndServe()
 	}()
 	go func() {
 		defer wg.Done()
-		if r.Logger != nil { r.Logger.Info(fmt.Sprintf("HTTPS (TCP) fallback listening on :%s", r.Port)) }
-		tcpServer.ListenAndServeTLS("", "")
+		if r.Logger != nil {
+			r.Logger.Info(fmt.Sprintf("HTTPS (TCP) fallback listening on :%s", r.Port))
+		}
+		_ = tcpServer.ListenAndServeTLS("", "")
 	}()
 	wg.Wait()
 }
@@ -448,7 +403,7 @@ func generateEphemeralTLS() (*tls.Config, error) {
 	}
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
-		Subject:      pkix.Name{Organization: []string{"Aura Microkernel"}},
+		Subject:      pkix.Name{Organization: []string{"Aura Microkernel Architecture"}},
 		NotBefore:    time.Now(),
 		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,

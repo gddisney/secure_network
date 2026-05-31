@@ -13,23 +13,16 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/flynn/noise"
+	"github.com/0TrustCloud/auth_provider"
 	"github.com/0TrustCloud/logger"
-	"github.com/0trustCloud/service_keys"
-	"github.com/0TrustCloud/ultimate_db"
-	"github.com/0TrustCloud/webauthnext"
+	"github.com/0TrustCloud/secure_data_format"
+	"github.com/flynn/noise"
 	"github.com/google/go-tpm/legacy/tpm2"
 	"github.com/quic-go/quic-go"
 )
 
-const (
-	ConfigPageID ultimate_db.PageID = 99
-	TaskPageID   ultimate_db.PageID = 100
-)
-
 type MeshNode struct {
-	db *ultimate_db.DB
-
+	SdfEngine *secure_data_format.SecureDataEngine
 	noisePriv []byte
 	noisePub  []byte
 
@@ -52,299 +45,129 @@ type MeshNode struct {
 
 	rpc *RPCManager
 
-	serviceKeys *service_keys.ServiceKeyManager
-
 	Logger *logger.LogDispatcher
 }
 
-func loadOrGenerateKeys(
-	db *ultimate_db.DB,
-	sysLog *logger.LogDispatcher,
-) ([]byte, []byte, ed25519.PrivateKey, error) {
+func loadOrGenerateKeys(sdf *secure_data_format.SecureDataEngine, sysLog *logger.LogDispatcher) ([]byte, []byte, ed25519.PrivateKey, error) {
+	txn := sdf.Store.Begin()
+	noisePriv, err1 := sdf.Store.Get(txn, []byte("data:mesh_noise_priv"))
+	noisePub, err2 := sdf.Store.Get(txn, []byte("data:mesh_noise_pub"))
+	dbscPrivRaw, err3 := sdf.Store.Get(txn, []byte("data:mesh_dbsc_priv"))
+	txn.Commit()
 
-	txn := db.BeginTxn()
-	defer db.CommitTxn(txn)
-
-	noisePriv, err1 := db.Read(
-		ConfigPageID,
-		txn,
-		[]byte("mesh_noise_priv"),
-	)
-
-	noisePub, err2 := db.Read(
-		ConfigPageID,
-		txn,
-		[]byte("mesh_noise_pub"),
-	)
-
-	dbscPrivRaw, err3 := db.Read(
-		ConfigPageID,
-		txn,
-		[]byte("mesh_dbsc_priv"),
-	)
-
-	if err1 == nil &&
-		err2 == nil &&
-		err3 == nil {
-
-		return noisePriv,
-			noisePub,
-			ed25519.PrivateKey(dbscPrivRaw),
-			nil
+	if err1 == nil && err2 == nil && err3 == nil {
+		return noisePriv, noisePub, ed25519.PrivateKey(dbscPrivRaw), nil
 	}
 
 	if sysLog != nil {
-
-		sysLog.Info(
-			"No mesh identity found. Generating new node keys...",
-		)
+		sysLog.Info("No mesh identity attributes discovered. Generating fresh keypair rows...")
 	}
 
-	cipher := noise.NewCipherSuite(
-		noise.DH25519,
-		noise.CipherAESGCM,
-		noise.HashSHA256,
-	)
-
-	kp, err := cipher.GenerateKeypair(
-		rand.Reader,
-	)
-
+	cipher := noise.NewCipherSuite(noise.DH25519, noise.CipherAESGCM, noise.HashSHA256)
+	kp, err := cipher.GenerateKeypair(rand.Reader)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	_, dbscPriv, err := ed25519.GenerateKey(
-		rand.Reader,
-	)
-
+	_, dbscPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	if err := db.Write(
-		ConfigPageID,
-		txn,
-		[]byte("mesh_noise_priv"),
-		kp.Private,
-		0,
-	); err != nil {
-
+	wTxn := sdf.Store.Begin()
+	_ = sdf.Store.Put(wTxn, []byte("data:mesh_noise_priv"), kp.Private, 0)
+	_ = sdf.Store.Put(wTxn, []byte("data:mesh_noise_pub"), kp.Public, 0)
+	_ = sdf.Store.Put(wTxn, []byte("data:mesh_dbsc_priv"), []byte(dbscPriv), 0)
+	if err := wTxn.Commit(); err != nil {
 		return nil, nil, nil, err
 	}
 
-	if err := db.Write(
-		ConfigPageID,
-		txn,
-		[]byte("mesh_noise_pub"),
-		kp.Public,
-		0,
-	); err != nil {
-
-		return nil, nil, nil, err
-	}
-
-	if err := db.Write(
-		ConfigPageID,
-		txn,
-		[]byte("mesh_dbsc_priv"),
-		[]byte(dbscPriv),
-		0,
-	); err != nil {
-
-		return nil, nil, nil, err
-	}
-
-	return kp.Private,
-		kp.Public,
-		dbscPriv,
-		nil
+	return kp.Private, kp.Public, dbscPriv, nil
 }
 
-func NewMeshNode(
-	db *ultimate_db.DB,
-	gatePub []byte,
-	skm *service_keys.ServiceKeyManager,
-	sysLog *logger.LogDispatcher,
-) (*MeshNode, error) {
-
-	nPriv,
-		nPub,
-		dPriv,
-		err := loadOrGenerateKeys(
-		db,
-		sysLog,
-	)
-
+func NewMeshNode(sdf *secure_data_format.SecureDataEngine, gatePub []byte, sysLog *logger.LogDispatcher) (*MeshNode, error) {
+	nPriv, nPub, dPriv, err := loadOrGenerateKeys(sdf, sysLog)
 	if err != nil {
-
-		return nil,
-			fmt.Errorf(
-				"failed to initialize mesh identity: %w",
-				err,
-			)
+		return nil, fmt.Errorf("failed to initialize mesh identity: %w", err)
 	}
 
-	ctx, cancel := context.WithCancel(
-		context.Background(),
-	)
-
-	node := &MeshNode{
-		db:        db,
+	ctx, cancel := context.WithCancel(context.Background())
+	return &MeshNode{
+		SdfEngine: sdf,
 		noisePriv: nPriv,
 		noisePub:  nPub,
 		dbscPriv:  dPriv,
 		gatePub:   gatePub,
-		cipher: noise.NewCipherSuite(
-			noise.DH25519,
-			noise.CipherAESGCM,
-			noise.HashSHA256,
-		),
-		serviceKeys: skm,
-		Logger:      sysLog,
-		ctx:         ctx,
-		cancel:      cancel,
-	}
-
-	return node, nil
+		cipher:    noise.NewCipherSuite(noise.DH25519, noise.CipherAESGCM, noise.HashSHA256),
+		Logger:    sysLog,
+		ctx:       ctx,
+		cancel:    cancel,
+	}, nil
 }
 
-func (m *MeshNode) SetRPCManager(
-	rpc *RPCManager,
-) {
-	m.rpc = rpc
-}
+func (m *MeshNode) SetRPCManager(rpc *RPCManager) { m.rpc = rpc }
+func (m *MeshNode) GetNoisePubKey() []byte      { return m.noisePub }
+func (m *MeshNode) GetDBSCPrivKey() ed25519.PrivateKey { return m.dbscPriv }
 
-func (m *MeshNode) GetNoisePubKey() []byte {
-	return m.noisePub
-}
-
-func (m *MeshNode) GetDBSCPrivKey() ed25519.PrivateKey {
-	return m.dbscPriv
-}
-
-func (m *MeshNode) Connect(
-	ctx context.Context,
-	gatewayAddr string,
-) error {
-
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos: []string{
-			"secure-overlay",
-		},
+func (m *MeshNode) Connect(ctx context.Context, gatewayAddr string) error {
+	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"secure-overlay"}}
+	conn, err := quic.DialAddr(ctx, gatewayAddr, tlsConf, nil)
+	if err != nil {
+		return fmt.Errorf("mesh QUIC pipe initiation failed: %w", err)
 	}
 
-	conn, err := quic.DialAddr(
-		ctx,
-		gatewayAddr,
-		tlsConf,
-		nil,
-	)
-
+	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-
-		return fmt.Errorf(
-			"mesh QUIC dial failed: %w",
-			err,
-		)
-	}
-
-	stream, err := conn.OpenStreamSync(
-		ctx,
-	)
-
-	if err != nil {
-
-		conn.CloseWithError(
-			0,
-			"stream open failed",
-		)
-
+		conn.CloseWithError(0, "failed opening initial stream frame")
 		return err
 	}
 
-	hs, err := noise.NewHandshakeState(
-		noise.Config{
-			CipherSuite: m.cipher,
-			Random:      rand.Reader,
-			Pattern:     noise.HandshakeIK,
-			Initiator:   true,
-			StaticKeypair: noise.DHKey{
-				Private: m.noisePriv,
-				Public:  m.noisePub,
-			},
-			PeerStatic: m.gatePub,
-		},
-	)
-
+	hs, err := noise.NewHandshakeState(noise.Config{
+		CipherSuite:   m.cipher,
+		Random:        rand.Reader,
+		Pattern:       noise.HandshakeIK,
+		Initiator:     true,
+		StaticKeypair: noise.DHKey{Private: m.noisePriv, Public: m.noisePub},
+		PeerStatic:    m.gatePub,
+	})
 	if err != nil {
-
-		conn.CloseWithError(
-			0,
-			"noise init failed",
-		)
-
+		conn.CloseWithError(0, "noise engine instantiation fault")
 		return err
 	}
 
-	msg, csSend, csRecv, err := hs.WriteMessage(
-		nil,
-		nil,
-	)
-
+	msg, csSend, csRecv, err := hs.WriteMessage(nil, nil)
 	if err != nil {
-
-		conn.CloseWithError(
-			0,
-			"noise write failed",
-		)
-
+		conn.CloseWithError(0, "handshake serialization error")
 		return err
 	}
 
-	if err := WriteFrame(
-		stream,
-		msg,
-	); err != nil {
+	script := fmt.Sprintf(`protocol:handshake(stage("initiator") status("transmitting"))`)
+	tx := secure_data_format.DataInvocation{
+		TargetAddress: "protocol:handshake:outbound",
+		Caller:        base64.StdEncoding.EncodeToString(m.noisePub),
+		Nonce:         0,
+		Method:        "START_HANDSHAKE",
+		Profile:       secure_data_format.ProfileProofOfPoss,
+	}
+	if _, err := m.SdfEngine.CompileSecureData(script, tx); err != nil {
+		conn.CloseWithError(0, "policy constraint rejected transition")
+		return fmt.Errorf("messaging state machine rejected protocol handshake context: %w", err)
+	}
 
-		conn.CloseWithError(
-			0,
-			"handshake send failed",
-		)
-
+	if err := WriteFrame(stream, msg); err != nil {
+		conn.CloseWithError(0, "failed flushing wire payload")
 		return err
 	}
 
-	resp, err := ReadFrame(
-		stream,
-		MaxFrameSize,
-	)
-
+	resp, err := ReadFrame(stream, MaxFrameSize)
 	if err != nil {
-
-		conn.CloseWithError(
-			0,
-			"handshake read failed",
-		)
-
+		conn.CloseWithError(0, "failed extraction of responder stream context")
 		return err
 	}
 
-	if _, _, _, err := hs.ReadMessage(
-		nil,
-		resp,
-	); err != nil {
-
-		conn.CloseWithError(
-			0,
-			"handshake rejected",
-		)
-
-		return fmt.Errorf(
-			"gateway rejected Noise handshake: %w",
-			err,
-		)
+	if _, _, _, err := hs.ReadMessage(nil, resp); err != nil {
+		conn.CloseWithError(0, "handshake failed validation")
+		return fmt.Errorf("remote gateway rejected Noise payload sequence: %w", err)
 	}
 
 	m.conn = conn
@@ -353,51 +176,27 @@ func (m *MeshNode) Connect(
 	m.csRecv = csRecv
 
 	if m.Logger != nil {
-
-		m.Logger.Info(
-			fmt.Sprintf(
-				"Mesh overlay connected. Node: %x",
-				m.noisePub[:8],
-			),
-		)
+		m.Logger.Info(fmt.Sprintf("Noise protocol handshake completed. Active Node ID: %x", m.noisePub[:8]))
 	}
 
 	go m.listenLoop()
-
 	return nil
 }
 
 func (m *MeshNode) Close() error {
-
 	m.cancel()
-
 	if m.conn != nil {
-
-		return m.conn.CloseWithError(
-			0,
-			"shutdown",
-		)
+		return m.conn.CloseWithError(0, "shutdown requested")
 	}
-
 	return nil
 }
 
-func (m *MeshNode) SendAction(
-	payload APIPayload,
-) error {
-
-	if m.stream == nil ||
-		m.csSend == nil {
-
-		return fmt.Errorf(
-			"mesh tunnel not established",
-		)
+func (m *MeshNode) SendAction(payload APIPayload) error {
+	if m.stream == nil || m.csSend == nil {
+		return fmt.Errorf("mesh tunnel context unavailable")
 	}
 
-	data, err := json.Marshal(
-		payload,
-	)
-
+	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
@@ -405,186 +204,87 @@ func (m *MeshNode) SendAction(
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
 
-	encrypted, err := m.csSend.Encrypt(
-		nil,
-		nil,
-		data,
-	)
-
+	encrypted, err := m.csSend.Encrypt(nil, nil, data)
 	if err != nil {
-
-		return fmt.Errorf(
-			"noise encryption failed: %w",
-			err,
-		)
+		return fmt.Errorf("frame layer cipher operation fault: %w", err)
 	}
 
-	return WriteFrame(
-		m.stream,
-		encrypted,
-	)
+	return WriteFrame(m.stream, encrypted)
 }
 
 func (m *MeshNode) listenLoop() {
-
 	for {
-
 		select {
-
 		case <-m.ctx.Done():
 			return
-
 		default:
 		}
 
-		frame, err := ReadFrame(
-			m.stream,
-			MaxFrameSize,
-		)
-
+		frame, err := ReadFrame(m.stream, MaxFrameSize)
 		if err != nil {
-
 			if m.Logger != nil {
-
-				m.Logger.Error(
-					fmt.Sprintf(
-						"Mesh stream closed: %v",
-						err,
-					),
-				)
+				m.Logger.Error(fmt.Sprintf("Mesh stream session frame terminated: %v", err))
 			}
-
 			return
 		}
 
-		decrypted, err := m.csRecv.Decrypt(
-			nil,
-			nil,
-			frame,
-		)
-
+		decrypted, err := m.csRecv.Decrypt(nil, nil, frame)
 		if err != nil {
-
 			if m.Logger != nil {
-
-				m.Logger.Error(
-					fmt.Sprintf(
-						"Noise decrypt failed: %v",
-						err,
-					),
-				)
+				m.Logger.Error(fmt.Sprintf("Noise protocol layer decryption failure: %v", err))
 			}
-
 			continue
 		}
 
 		var req APIPayload
-
-		if err := json.Unmarshal(
-			decrypted,
-			&req,
-		); err != nil {
-
+		if err := json.Unmarshal(decrypted, &req); err != nil {
 			continue
 		}
 
 		switch req.Action {
-
 		case "dbsc_heartbeat_req":
-
-			m.handleHeartbeat(
-				req.Content,
-			)
-
+			m.handleHeartbeat(req.Content)
 		case "rpc":
-
 			if m.rpc != nil {
-
-				m.rpc.handleIngress(
-					context.Background(),
-					[]byte(req.Content),
-				)
+				m.rpc.handleIngress(context.Background(), []byte(req.Content))
 			}
 		}
 	}
 }
 
-func (m *MeshNode) handleHeartbeat(
-	challenge string,
-) {
-
-	hash := sha256.Sum256(
-		[]byte(challenge),
-	)
-
-	sig, err := rsa.SignPKCS1v15(
-		rand.Reader,
-		nil,
-		crypto.SHA256,
-		hash[:],
-	)
-
+func (m *MeshNode) handleHeartbeat(challenge string) {
+	hash := sha256.Sum256([]byte(challenge))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, nil, crypto.SHA256, hash[:])
 	if err != nil {
-
 		if m.Logger != nil {
-
-			m.Logger.Error(
-				fmt.Sprintf(
-					"Heartbeat signing failed: %v",
-					err,
-				),
-			)
+			m.Logger.Error(fmt.Sprintf("Heartbeat signing operation failed: %v", err))
 		}
-
 		return
 	}
 
 	payload := APIPayload{
-		Action: "dbsc_heartbeat_resp",
-		Content: base64.StdEncoding.EncodeToString(
-			sig,
-		),
+		Action:  "dbsc_heartbeat_resp",
+		Content: base64.StdEncoding.EncodeToString(sig),
 	}
-
-	_ = m.SendAction(
-		payload,
-	)
+	_ = m.SendAction(payload)
 }
 
-func (m *MeshNode) VerifyMachineIdentity(
-	username string,
-	nonce string,
-	signature string,
-	scope string,
-) error {
-
-	txn := m.db.BeginTxn()
-	defer m.db.CommitTxn(txn)
-
-	userBytes, err := m.db.Read(
-		IdentityPageID,
-		txn,
-		[]byte("user:"+username),
-	)
+func (m *MeshNode) VerifyMachineIdentity(username string, nonce string, signature string, scope string) error {
+	dataKey := "data:user:" + username
+	txn := m.SdfEngine.Store.Begin()
+	userBytes, err := m.SdfEngine.Store.Get(txn, []byte(dataKey))
+	txn.Commit()
 
 	if err != nil {
 		return err
 	}
 
-	var user webauthnext.PasskeyUser
-
-	if err := json.Unmarshal(
-		userBytes,
-		&user,
-	); err != nil {
-
+	var user auth_provider.PasskeyUser
+	if err := json.Unmarshal(userBytes, &user); err != nil {
 		return err
 	}
 
-	tpmPubKey, err := tpm2.DecodePublic(
-		user.ID,
-	)
-
+	tpmPubKey, err := tpm2.DecodePublic(user.ID)
 	if err != nil {
 		return err
 	}
@@ -595,36 +295,29 @@ func (m *MeshNode) VerifyMachineIdentity(
 	}
 
 	rsaKey, ok := cryptoKey.(*rsa.PublicKey)
-
 	if !ok {
-
-		return fmt.Errorf(
-			"invalid RSA public key",
-		)
+		return fmt.Errorf("invalid RSA hardware identity profile layout")
 	}
 
-	sigBytes, err := base64.StdEncoding.DecodeString(
-		signature,
-	)
-
+	sigBytes, err := base64.StdEncoding.DecodeString(signature)
 	if err != nil {
 		return err
 	}
 
-	hash := sha256.Sum256(
-		[]byte(
-			fmt.Sprintf(
-				"%s|%s",
-				nonce,
-				scope,
-			),
-		),
-	)
+	payload := fmt.Sprintf("%s|%s", nonce, scope)
+	hash := sha256.Sum256([]byte(payload))
 
-	return rsa.VerifyPKCS1v15(
-		rsaKey,
-		crypto.SHA256,
-		hash[:],
-		sigBytes,
-	)
+	script := fmt.Sprintf(`identity:verification(user("%s") verification_type("machine_attestation"))`, username)
+	tx := secure_data_format.DataInvocation{
+		TargetAddress: "identity:check:hardware:" + username,
+		Caller:        "mesh-network-verification-kernel",
+		Nonce:         0,
+		Method:        "VERIFY_MACHINE",
+		Profile:       secure_data_format.ProfileProofOfPoss,
+	}
+	if _, err := m.SdfEngine.CompileSecureData(script, tx); err != nil {
+		return fmt.Errorf("secure dataframe rule evaluation blocked authentication pipeline: %w", err)
+	}
+
+	return rsa.VerifyPKCS1v15(rsaKey, crypto.SHA256, hash[:], sigBytes)
 }

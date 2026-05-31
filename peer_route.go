@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/0TrustCloud/logger"
-	"github.com/0TrustCloud/service_keys"
+	"github.com/0TrustCloud/secure_data_format"
 )
 
 type AccessPolicy int
@@ -41,415 +41,203 @@ type PeerMessage struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-type PeerHandler func(
-	ctx context.Context,
-	msg *PeerMessage,
-) error
+type PeerHandler func(ctx context.Context, msg *PeerMessage) error
 
 type PeerRoute struct {
-	meshNode *MeshNode
-
-	serviceKeys *service_keys.ServiceKeyManager
-
-	Logger *logger.LogDispatcher
-
-	mu sync.RWMutex
-
-	handlers map[string]PeerHandler
-
+	meshNode       *MeshNode
+	Logger         *logger.LogDispatcher
+	mu             sync.RWMutex
+	handlers       map[string]PeerHandler
 	accessPolicies map[NodeID]AccessPolicy
-
-	peers map[string]*PeerIdentity
+	peers          map[string]*PeerIdentity
 }
 
-func NewPeerRoute(
-	node *MeshNode,
-	skm *service_keys.ServiceKeyManager,
-	sysLog *logger.LogDispatcher,
-) *PeerRoute {
-
-	pr := &PeerRoute{
+func NewPeerRoute(node *MeshNode, sysLog *logger.LogDispatcher) *PeerRoute {
+	return &PeerRoute{
 		meshNode:       node,
-		serviceKeys:    skm,
 		Logger:         sysLog,
 		handlers:       make(map[string]PeerHandler),
 		accessPolicies: make(map[NodeID]AccessPolicy),
 		peers:          make(map[string]*PeerIdentity),
 	}
-
-	return pr
 }
 
-func (pr *PeerRoute) RegisterHandler(
-	route string,
-	handler PeerHandler,
-) {
-
+func (pr *PeerRoute) RegisterHandler(route string, handler PeerHandler) {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
-
 	pr.handlers[route] = handler
 }
 
-func (pr *PeerRoute) Dispatch(
-	ctx context.Context,
-	msg *PeerMessage,
-) error {
-
+func (pr *PeerRoute) Dispatch(ctx context.Context, msg *PeerMessage) error {
 	pr.mu.RLock()
-
 	handler, ok := pr.handlers[msg.Route]
-
 	pr.mu.RUnlock()
 
 	if !ok {
-
-		return fmt.Errorf(
-			"no handler registered for route: %s",
-			msg.Route,
-		)
+		return fmt.Errorf("no handler registered for route: %s", msg.Route)
 	}
-
-	return handler(
-		ctx,
-		msg,
-	)
+	return handler(ctx, msg)
 }
 
-func (pr *PeerRoute) Broadcast(
-	ctx context.Context,
-	route string,
-	payload []byte,
-) error {
-
+func (pr *PeerRoute) Broadcast(ctx context.Context, route string, payload []byte) error {
 	if pr.meshNode == nil {
-
-		return fmt.Errorf(
-			"mesh node unavailable",
-		)
+		return fmt.Errorf("mesh node context unavailable")
 	}
 
-	hash := sha256.Sum256(
-		append(
-			[]byte(route),
-			payload...,
-		),
-	)
-
+	hash := sha256.Sum256(append([]byte(route), payload...))
 	msg := PeerMessage{
-		ID: hex.EncodeToString(
-			hash[:],
-		),
-		Route: route,
-		Payload: payload,
-		Origin: pr.meshNode.noisePub,
+		ID:        hex.EncodeToString(hash[:]),
+		Route:     route,
+		Payload:   payload,
+		Origin:    pr.meshNode.noisePub,
 		Timestamp: time.Now(),
 	}
 
-	raw, err := json.Marshal(
-		msg,
-	)
-
+	raw, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
 
-	return pr.meshNode.SendAction(
-		APIPayload{
-			Action: "rpc",
-			Content: string(raw),
-		},
-	)
+	return pr.meshNode.SendAction(APIPayload{Action: "rpc", Content: string(raw)})
 }
 
-func (pr *PeerRoute) SendToPeer(
-	ctx context.Context,
-	peerID []byte,
-	route string,
-	payload []byte,
-) error {
-
+func (pr *PeerRoute) SendToPeer(ctx context.Context, peerID []byte, route string, payload []byte) error {
 	if pr.meshNode == nil {
-
-		return fmt.Errorf(
-			"mesh node unavailable",
-		)
+		return fmt.Errorf("mesh node context unavailable")
 	}
 
-	hash := sha256.Sum256(
-		append(
-			peerID,
-			payload...,
-		),
-	)
-
+	hash := sha256.Sum256(append(peerID, payload...))
 	msg := PeerMessage{
-		ID: hex.EncodeToString(
-			hash[:],
-		),
-		Route: route,
-		Payload: payload,
-		Origin: pr.meshNode.noisePub,
+		ID:        hex.EncodeToString(hash[:]),
+		Route:     route,
+		Payload:   payload,
+		Origin:    pr.meshNode.noisePub,
 		Timestamp: time.Now(),
 	}
 
-	raw, err := json.Marshal(
-		msg,
-	)
-
+	raw, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
 
-	return pr.meshNode.SendAction(
-		APIPayload{
-			Action: "rpc",
-			Content: string(raw),
-		},
-	)
+	return pr.meshNode.SendAction(APIPayload{Action: "rpc", Content: string(raw)})
 }
 
-func (pr *PeerRoute) HandleIngress(
-	ctx context.Context,
-	payload []byte,
-) error {
-
+func (pr *PeerRoute) HandleIngress(ctx context.Context, payload []byte) error {
 	var msg PeerMessage
-
-	if err := json.Unmarshal(
-		payload,
-		&msg,
-	); err != nil {
-
+	if err := json.Unmarshal(payload, &msg); err != nil {
 		return err
 	}
-
-	return pr.Dispatch(
-		ctx,
-		&msg,
-	)
+	return pr.Dispatch(ctx, &msg)
 }
 
-func (pr *PeerRoute) AddPeer(
-	peer *PeerIdentity,
-) {
-
+func (pr *PeerRoute) AddPeer(peer *PeerIdentity) {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
-
-	key := hex.EncodeToString(
-		peer.NodeID[:],
-	)
-
-	pr.peers[key] = peer
+	pr.peers[hex.EncodeToString(peer.NodeID[:])] = peer
 }
 
-func (pr *PeerRoute) RemovePeer(
-	nodeID NodeID,
-) {
-
+func (pr *PeerRoute) RemovePeer(nodeID NodeID) {
 	pr.mu.Lock()
-	defer pr.mu.Unlock()
-
-	key := hex.EncodeToString(
-		nodeID[:],
-	)
-
-	delete(
-		pr.peers,
-		key,
-	)
+	pr.mu.Unlock()
+	delete(pr.peers, hex.EncodeToString(nodeID[:]))
 }
 
 func (pr *PeerRoute) ListPeers() []*PeerIdentity {
-
 	pr.mu.RLock()
 	defer pr.mu.RUnlock()
-
-	out := make(
-		[]*PeerIdentity,
-		0,
-		len(pr.peers),
-	)
-
+	out := make([]*PeerIdentity, 0, len(pr.peers))
 	for _, peer := range pr.peers {
-
-		out = append(
-			out,
-			peer,
-		)
+		out = append(out, peer)
 	}
-
 	return out
 }
 
-func (pr *PeerRoute) SetAccessPolicy(
-	nodeID NodeID,
-	policy AccessPolicy,
-) {
-
+func (pr *PeerRoute) SetAccessPolicy(nodeID NodeID, policy AccessPolicy) {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
-
 	pr.accessPolicies[nodeID] = policy
 }
 
-func (pr *PeerRoute) EvaluateSwarmHandshake(
-	remotePub []byte,
-	intent string,
-) (bool, error) {
-
+func (pr *PeerRoute) EvaluateSwarmHandshake(remotePub []byte, intent string) (bool, error) {
 	if len(remotePub) < 32 {
-
-		return false,
-			fmt.Errorf(
-				"invalid remote identity",
-			)
+		return false, fmt.Errorf("invalid identity attributes length")
 	}
 
 	var nodeID NodeID
+	copy(nodeID[:], remotePub[:32])
 
-	copy(
-		nodeID[:],
-		remotePub[:32],
-	)
+	// Assert access policy checks using transient dataframe evaluations
+	script := fmt.Sprintf(`network:swarm_ingress(intent("%s") node("%x"))`, intent, remotePub[:4])
+	tx := secure_data_format.DataInvocation{
+		TargetAddress: "swarm:ingress:policy",
+		Caller:        hex.EncodeToString(remotePub),
+		Nonce:         0,
+		Method:        "EVALUATE_SWARM",
+		Profile:       secure_data_format.ProfileGrant,
+	}
+	if _, err := pr.meshNode.SdfEngine.CompileSecureData(script, tx); err != nil {
+		return false, fmt.Errorf("sdf dataframe policy blocked entry authorization parameters: %w", err)
+	}
 
 	pr.mu.RLock()
-
 	policy, ok := pr.accessPolicies[nodeID]
-
 	pr.mu.RUnlock()
 
 	if !ok {
-
-		return false,
-			fmt.Errorf(
-				"no access policy defined",
-			)
+		return false, fmt.Errorf("no capability mapping defined for target context node")
 	}
 
 	switch policy {
-
-	case Admin:
+	case Admin, See:
 		return true, nil
-
 	case Write:
-
-		if intent == "WRITE_INTENT" ||
-			intent == "READ_INTENT" ||
-			intent == "S2P_PULL" {
-
+		if intent == "WRITE_INTENT" || intent == "READ_INTENT" || intent == "S2P_PULL" {
 			return true, nil
 		}
-
-	case See:
-		return true, nil
-
 	case ReadOnly:
-
-		if intent == "READ_INTENT" ||
-			intent == "S2P_PULL" {
-
+		if intent == "READ_INTENT" || intent == "S2P_PULL" {
 			return true, nil
 		}
-
 	case Deny:
-		return false,
-			fmt.Errorf(
-				"policy denied",
-			)
+		return false, fmt.Errorf("policy explicitly denied")
 	}
 
-	return false,
-		fmt.Errorf(
-			"intent rejected",
-		)
+	return false, fmt.Errorf("intent signature validation rejected")
 }
 
-func (pr *PeerRoute) HasPeer(
-	nodeID NodeID,
-) bool {
-
+func (pr *PeerRoute) HasPeer(nodeID NodeID) bool {
 	pr.mu.RLock()
 	defer pr.mu.RUnlock()
-
-	key := hex.EncodeToString(
-		nodeID[:],
-	)
-
-	_, ok := pr.peers[key]
-
+	_, ok := pr.peers[hex.EncodeToString(nodeID[:])]
 	return ok
 }
 
-func (pr *PeerRoute) GetPeer(
-	nodeID NodeID,
-) (*PeerIdentity, bool) {
-
+func (pr *PeerRoute) GetPeer(nodeID NodeID) (*PeerIdentity, bool) {
 	pr.mu.RLock()
 	defer pr.mu.RUnlock()
-
-	key := hex.EncodeToString(
-		nodeID[:],
-	)
-
-	peer, ok := pr.peers[key]
-
+	peer, ok := pr.peers[hex.EncodeToString(nodeID[:])]
 	return peer, ok
 }
 
-func (pr *PeerRoute) TouchPeer(
-	nodeID NodeID,
-) {
-
+func (pr *PeerRoute) TouchPeer(nodeID NodeID) {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
-
-	key := hex.EncodeToString(
-		nodeID[:],
-	)
-
-	if peer, ok := pr.peers[key]; ok {
-
+	if peer, ok := pr.peers[hex.EncodeToString(nodeID[:])]; ok {
 		peer.LastSeen = time.Now()
 	}
 }
 
 func (pr *PeerRoute) PeerCount() int {
-
 	pr.mu.RLock()
 	defer pr.mu.RUnlock()
-
-	return len(
-		pr.peers,
-	)
+	return len(pr.peers)
 }
 
-func (pr *PeerRoute) SignMessage(
-	serviceID string,
-	payload []byte,
-	priv ed25519.PrivateKey,
-) ([]byte, error) {
-
+func (pr *PeerRoute) SignMessage(serviceID string, payload []byte, priv ed25519.PrivateKey) ([]byte, error) {
 	if len(priv) == 0 {
-
-		return nil,
-			fmt.Errorf(
-				"missing private key",
-			)
+		return nil, fmt.Errorf("missing private signing key matrix")
 	}
-
-	hash := sha256.Sum256(
-		append(
-			[]byte(serviceID),
-			payload...,
-		),
-	)
-
-	sig := ed25519.Sign(
-		priv,
-		hash[:],
-	)
-
-	return sig, nil
+	hash := sha256.Sum256(append([]byte(serviceID), payload...))
+	return ed25519.Sign(priv, hash[:]), nil
 }

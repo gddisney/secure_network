@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/0TrustCloud/logger"
+	"github.com/0TrustCloud/secure_data_format"
 )
 
 type RPCPacket struct {
@@ -23,10 +24,7 @@ type RPCPacket struct {
 	Error     string `json:"error,omitempty"`
 }
 
-type RPCHandler func(
-	ctx context.Context,
-	payload []byte,
-) ([]byte, error)
+type RPCHandler func(ctx context.Context, payload []byte) ([]byte, error)
 
 type pendingRPC struct {
 	ch chan *RPCPacket
@@ -34,21 +32,13 @@ type pendingRPC struct {
 
 type RPCManager struct {
 	peerRoute *PeerRoute
-
-	Logger *logger.LogDispatcher
-
-	mu sync.RWMutex
-
-	handlers map[string]RPCHandler
-
-	pending map[string]*pendingRPC
+	Logger    *logger.LogDispatcher
+	mu        sync.RWMutex
+	handlers  map[string]RPCHandler
+	pending   map[string]*pendingRPC
 }
 
-func NewRPCManager(
-	peerRoute *PeerRoute,
-	sysLog *logger.LogDispatcher,
-) *RPCManager {
-
+func NewRPCManager(peerRoute *PeerRoute, sysLog *logger.LogDispatcher) *RPCManager {
 	return &RPCManager{
 		peerRoute: peerRoute,
 		Logger:    sysLog,
@@ -57,55 +47,21 @@ func NewRPCManager(
 	}
 }
 
-func (m *RPCManager) Init() error {
-	return nil
-}
+func (m *RPCManager) Init(router *Router) error { return nil }
+func (m *RPCManager) Name() string             { return "rpc_manager" }
 
-func (m *RPCManager) Name() string {
-	return "rpc_manager"
-}
-
-func (m *RPCManager) Register(
-	method string,
-	handler RPCHandler,
-) {
-
+func (m *RPCManager) Register(method string, handler RPCHandler) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
 	m.handlers[method] = handler
-
-	if m.Logger != nil {
-
-		m.Logger.Info(
-			fmt.Sprintf(
-				"RPC method registered: %s",
-				method,
-			),
-		)
-	}
 }
 
-func (m *RPCManager) Call(
-	ctx context.Context,
-	target []byte,
-	method string,
-	payload []byte,
-	timeout time.Duration,
-) ([]byte, error) {
-
+func (m *RPCManager) Call(ctx context.Context, target []byte, method string, payload []byte, timeout time.Duration) ([]byte, error) {
 	reqIDBytes := make([]byte, 16)
-
-	if _, err := rand.Read(
-		reqIDBytes,
-	); err != nil {
-
+	if _, err := rand.Read(reqIDBytes); err != nil {
 		return nil, err
 	}
-
-	reqID := hex.EncodeToString(
-		reqIDBytes,
-	)
+	reqID := hex.EncodeToString(reqIDBytes)
 
 	packet := RPCPacket{
 		ID:        reqID,
@@ -116,233 +72,103 @@ func (m *RPCManager) Call(
 		Response:  false,
 	}
 
-	raw, err := json.Marshal(
-		packet,
-	)
-
+	raw, err := json.Marshal(packet)
 	if err != nil {
 		return nil, err
 	}
 
-	waiter := &pendingRPC{
-		ch: make(chan *RPCPacket, 1),
-	}
+	waiter := &pendingRPC{ch: make(chan *RPCPacket, 1)}
 
 	m.mu.Lock()
 	m.pending[reqID] = waiter
 	m.mu.Unlock()
 
 	defer func() {
-
 		m.mu.Lock()
-
-		delete(
-			m.pending,
-			reqID,
-		)
-
+		delete(m.pending, reqID)
 		m.mu.Unlock()
 	}()
 
-	err = m.peerRoute.SendToPeer(
-		ctx,
-		target,
-		"rpc",
-		raw,
-	)
-
+	err = m.peerRoute.SendToPeer(ctx, target, "rpc", raw)
 	if err != nil {
 		return nil, err
 	}
 
 	select {
-
 	case resp := <-waiter.ch:
-
 		if resp.Error != "" {
-
-			return nil,
-				fmt.Errorf(
-					"%s",
-					resp.Error,
-				)
+			return nil, fmt.Errorf("%s", resp.Error)
 		}
-
 		return resp.Payload, nil
-
 	case <-ctx.Done():
-
-		return nil,
-			ctx.Err()
-
+		return nil, ctx.Err()
 	case <-time.After(timeout):
-
-		return nil,
-			fmt.Errorf(
-				"rpc timeout",
-			)
+		return nil, fmt.Errorf("rpc capability execution timeout")
 	}
 }
 
-func (m *RPCManager) Broadcast(
-	ctx context.Context,
-	method string,
-	payload []byte,
-) error {
-
-	packet := RPCPacket{
-		Method:    method,
-		Payload:   payload,
-		Timestamp: time.Now().Unix(),
-		Response:  false,
-	}
-
-	raw, err := json.Marshal(
-		packet,
-	)
-
-	if err != nil {
-		return err
-	}
-
-	return m.peerRoute.Broadcast(
-		ctx,
-		"rpc",
-		raw,
-	)
+func (m *RPCManager) Broadcast(ctx context.Context, method string, payload []byte) error {
+	packet := RPCPacket{Method: method, Payload: payload, Timestamp: time.Now().Unix(), Response: false}
+	raw, _ := json.Marshal(packet)
+	return m.peerRoute.Broadcast(ctx, "rpc", raw)
 }
 
-func (m *RPCManager) Notify(
-	ctx context.Context,
-	method string,
-	payload []byte,
-) error {
-
-	packet := RPCPacket{
-		Method:    method,
-		Payload:   payload,
-		Timestamp: time.Now().Unix(),
-		Response:  false,
-	}
-
-	raw, err := json.Marshal(
-		packet,
-	)
-
-	if err != nil {
-		return err
-	}
-
-	return m.peerRoute.Broadcast(
-		ctx,
-		"rpc",
-		raw,
-	)
+func (m *RPCManager) Notify(ctx context.Context, method string, payload []byte) error {
+	packet := RPCPacket{Method: method, Payload: payload, Timestamp: time.Now().Unix(), Response: false}
+	raw, _ := json.Marshal(packet)
+	return m.peerRoute.Broadcast(ctx, "rpc", raw)
 }
 
-func (m *RPCManager) NotifyPeer(
-	ctx context.Context,
-	target []byte,
-	method string,
-	payload []byte,
-) error {
-
-	packet := RPCPacket{
-		Method:    method,
-		Payload:   payload,
-		Target:    target,
-		Timestamp: time.Now().Unix(),
-		Response:  false,
-	}
-
-	raw, err := json.Marshal(
-		packet,
-	)
-
-	if err != nil {
-		return err
-	}
-
-	return m.peerRoute.SendToPeer(
-		ctx,
-		target,
-		"rpc",
-		raw,
-	)
+func (m *RPCManager) NotifyPeer(ctx context.Context, target []byte, method string, payload []byte) error {
+	packet := RPCPacket{Method: method, Payload: payload, Target: target, Timestamp: time.Now().Unix(), Response: false}
+	raw, _ := json.Marshal(packet)
+	return m.peerRoute.SendToPeer(ctx, target, "rpc", raw)
 }
 
-func (m *RPCManager) handleIngress(
-	ctx context.Context,
-	payload []byte,
-) {
-
+func (m *RPCManager) handleIngress(ctx context.Context, payload []byte) {
 	var packet RPCPacket
-
-	if err := json.Unmarshal(
-		payload,
-		&packet,
-	); err != nil {
-
-		if m.Logger != nil {
-
-			m.Logger.Error(
-				fmt.Sprintf(
-					"RPC decode failed: %v",
-					err,
-				),
-			)
-		}
-
+	if err := json.Unmarshal(payload, &packet); err != nil {
 		return
 	}
 
 	if packet.Response {
-
 		m.mu.RLock()
-
 		waiter, ok := m.pending[packet.ID]
-
 		m.mu.RUnlock()
 
 		if ok {
-
 			select {
-
 			case waiter.ch <- &packet:
-
 			default:
 			}
 		}
-
 		return
+	}
+
+	// Validate routing permissions via transient dataframe row execution
+	if m.peerRoute != nil && m.peerRoute.meshNode != nil {
+		script := fmt.Sprintf(`rpc:invocation(method("%s") stage("ingress"))`, packet.Method)
+		tx := secure_data_format.DataInvocation{
+			TargetAddress: "network:rpc:" + packet.Method,
+			Caller:        hex.EncodeToString(packet.Source),
+			Nonce:         uint64(packet.Timestamp),
+			Method:        "ASSERT_RPC_CAPABILITY",
+			Profile:       secure_data_format.ProfileGrant,
+		}
+		if _, err := m.peerRoute.meshNode.SdfEngine.CompileSecureData(script, tx); err != nil {
+			return
+		}
 	}
 
 	m.mu.RLock()
-
 	handler, ok := m.handlers[packet.Method]
-
 	m.mu.RUnlock()
 
 	if !ok {
-
-		if m.Logger != nil {
-
-			m.Logger.Error(
-				fmt.Sprintf(
-					"Unknown RPC method: %s",
-					packet.Method,
-				),
-			)
-		}
-
 		return
 	}
 
-	respPayload, err := handler(
-		ctx,
-		packet.Payload,
-	)
-
+	respPayload, err := handler(ctx, packet.Payload)
 	resp := RPCPacket{
 		ID:        packet.ID,
 		Method:    packet.Method,
@@ -353,54 +179,17 @@ func (m *RPCManager) handleIngress(
 	}
 
 	if err != nil {
-
 		resp.Error = err.Error()
 	}
 
-	raw, marshalErr := json.Marshal(
-		resp,
-	)
-
+	raw, marshalErr := json.Marshal(resp)
 	if marshalErr != nil {
-
-		if m.Logger != nil {
-
-			m.Logger.Error(
-				fmt.Sprintf(
-					"RPC marshal failed: %v",
-					marshalErr,
-				),
-			)
-		}
-
 		return
 	}
 
 	if len(packet.Source) > 0 {
-
-		_ = m.peerRoute.SendToPeer(
-			ctx,
-			packet.Source,
-			"rpc",
-			raw,
-		)
-
+		_ = m.peerRoute.SendToPeer(ctx, packet.Source, "rpc", raw)
 	} else {
-
-		_ = m.peerRoute.Broadcast(
-			ctx,
-			"rpc",
-			raw,
-		)
+		_ = m.peerRoute.Broadcast(ctx, "rpc", raw)
 	}
-}
-
-// RPCContext is the struct requested by identity_provider
-type RPCContext struct {
-	Ctx context.Context
-}
-
-// Init now satisfies the secure_network.Module interface
-func (m *RPCManager) Init(router *Router) error {
-	return nil
 }

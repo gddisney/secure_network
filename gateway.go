@@ -3,505 +3,18 @@ package secure_network
 import (
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"sync"
 	"time"
 
-	"github.com/flynn/noise"
 	"github.com/0TrustCloud/logger"
-	"github.com/0TrustCloud/ultimate_db"
+	"github.com/0TrustCloud/secure_data_format"
+	"github.com/flynn/noise"
 	"github.com/quic-go/quic-go"
 )
-
-const (
-	IdentityPageID ultimate_db.PageID = 1
-	ContentPageID  ultimate_db.PageID = 2
-	StatsPageID    ultimate_db.PageID = 3
-
-	MaxFrameSize = 16 * 1024 * 1024
-)
-
-type Gateway struct {
-	router         *Router
-	peerMesh       *PeerRoute
-	cipher         noise.CipherSuite
-	sPriv          []byte
-	sPub           []byte
-	Logger         *logger.LogDispatcher
-	activeSessions sync.Map
-}
-
-func NewGateway(
-	r *Router,
-	peerMesh *PeerRoute,
-	sPriv,
-	sPub []byte,
-	sysLog *logger.LogDispatcher,
-) *Gateway {
-
-	return &Gateway{
-		router:   r,
-		peerMesh: peerMesh,
-		cipher: noise.NewCipherSuite(
-			noise.DH25519,
-			noise.CipherAESGCM,
-			noise.HashSHA256,
-		),
-		sPriv:  sPriv,
-		sPub:   sPub,
-		Logger: sysLog,
-	}
-}
-
-func (g *Gateway) SetApplicationHandler(
-	handler http.HandlerFunc,
-) {
-
-	if g.router != nil {
-		g.router.Mux.Handle("/", handler)
-	}
-}
-
-func (g *Gateway) ListenAndServe(
-	port string,
-	tlsConfig *tls.Config,
-) error {
-
-	if g.router != nil {
-
-		g.router.Port = port
-
-		if tlsConfig != nil {
-			g.router.TLSConfig = tlsConfig
-		}
-
-		g.router.Boot()
-	}
-
-	return nil
-}
-
-func (g *Gateway) HandleSecureStream(
-	conn quic.Conn,
-	stream *quic.Stream,
-) {
-
-	defer stream.Close()
-
-	hs, err := noise.NewHandshakeState(
-		noise.Config{
-			CipherSuite: g.cipher,
-			Pattern:     noise.HandshakeIK,
-			Initiator:   false,
-			StaticKeypair: noise.DHKey{
-				Private: g.sPriv,
-				Public:  g.sPub,
-			},
-		},
-	)
-
-	if err != nil {
-
-		if g.Logger != nil {
-			g.Logger.Error(
-				fmt.Sprintf(
-					"Gateway handshake init failed: %v",
-					err,
-				),
-			)
-		}
-
-		return
-	}
-
-	// READ HANDSHAKE FRAME
-	frame, err := ReadFrame(
-		stream,
-		MaxFrameSize,
-	)
-
-	if err != nil {
-
-		if g.Logger != nil {
-			g.Logger.Error(
-				fmt.Sprintf(
-					"Gateway failed reading handshake frame: %v",
-					err,
-				),
-			)
-		}
-
-		return
-	}
-
-	_, _, _, err = hs.ReadMessage(
-		nil,
-		frame,
-	)
-
-	if err != nil {
-
-		if g.Logger != nil {
-			g.Logger.Error(
-				fmt.Sprintf(
-					"Gateway handshake failed: %v",
-					err,
-				),
-			)
-		}
-
-		return
-	}
-
-	remoteKey := hs.PeerStatic()
-
-	if !g.isIdentityValid(remoteKey) {
-
-		if g.Logger != nil {
-
-			g.Logger.Audit(
-				"system_gateway",
-				"TUNNEL_REJECTED",
-				fmt.Sprintf(
-					"Revoked or unknown key: %x",
-					remoteKey[:8],
-				),
-			)
-		}
-
-		return
-	}
-
-	respMsg, csSend, csRecv, err := hs.WriteMessage(
-		nil,
-		nil,
-	)
-
-	if err != nil {
-
-		if g.Logger != nil {
-			g.Logger.Error(
-				fmt.Sprintf(
-					"Handshake response failed: %v",
-					err,
-				),
-			)
-		}
-
-		return
-	}
-
-	err = WriteFrame(
-		stream,
-		respMsg,
-	)
-
-	if err != nil {
-
-		if g.Logger != nil {
-			g.Logger.Error(
-				fmt.Sprintf(
-					"Failed writing handshake response: %v",
-					err,
-				),
-			)
-		}
-
-		return
-	}
-
-	sessionID := string(remoteKey)
-
-	g.activeSessions.Store(
-		sessionID,
-		time.Now().Unix(),
-	)
-
-	stopHeartbeat := make(chan struct{})
-
-	defer close(stopHeartbeat)
-
-	go g.monitorHeartbeat(
-		stream,
-		csSend,
-		remoteKey,
-		stopHeartbeat,
-	)
-
-	if g.Logger != nil {
-
-		g.Logger.Audit(
-			fmt.Sprintf("%x", remoteKey[:8]),
-			"TUNNEL_ESTABLISHED",
-			"Secure QUIC tunnel established",
-		)
-	}
-
-	for {
-
-		frame, err := ReadFrame(
-			stream,
-			MaxFrameSize,
-		)
-
-		if err != nil {
-
-			if g.Logger != nil {
-				g.Logger.Error(
-					fmt.Sprintf(
-						"Secure stream closed: %v",
-						err,
-					),
-				)
-			}
-
-			break
-		}
-
-		decrypted, err := csRecv.Decrypt(
-			nil,
-			nil,
-			frame,
-		)
-
-		if err != nil {
-
-			if g.Logger != nil {
-				g.Logger.Error(
-					fmt.Sprintf(
-						"Noise decrypt failed: %v",
-						err,
-					),
-				)
-			}
-
-			continue
-		}
-
-		var req APIPayload
-
-		if err := json.Unmarshal(
-			decrypted,
-			&req,
-		); err == nil {
-
-			if req.Action == "tunnel_bind" {
-
-				if mod, exists := g.router.Modules["mesh_tunnel"]; exists {
-
-					tunnelManager, ok := mod.(*TunnelManager)
-
-					if !ok {
-						continue
-					}
-
-					err := tunnelManager.RegisterTunnel(
-						conn,
-						[]byte(req.Content),
-					)
-
-					if err != nil {
-
-						_ = WriteFrame(
-							stream,
-							[]byte(
-								"HTTP/1.1 403 Forbidden\r\n\r\n",
-							),
-						)
-					}
-
-					return
-				}
-			}
-		}
-
-		g.routeToAPI(
-			remoteKey,
-			decrypted,
-		)
-	}
-
-	g.activeSessions.Delete(sessionID)
-}
-
-func (g *Gateway) isIdentityValid(
-	pubKey []byte,
-) bool {
-
-	return g.router.PolicyEngine.HasPermission(
-		pubKey,
-		"network:connect",
-	)
-}
-
-func (g *Gateway) monitorHeartbeat(
-	stream *quic.Stream,
-	csSend *noise.CipherState,
-	signer []byte,
-	stop <-chan struct{},
-) {
-
-	ticker := time.NewTicker(
-		2 * time.Minute,
-	)
-
-	defer ticker.Stop()
-
-	for {
-
-		select {
-
-		case <-ticker.C:
-
-			lastSeen, ok := g.activeSessions.Load(
-				string(signer),
-			)
-
-			if !ok ||
-				time.Now().Unix()-lastSeen.(int64) > 180 {
-
-				if g.Logger != nil {
-
-					g.Logger.Info(
-						fmt.Sprintf(
-							"Tunnel timed out for %x. Closing.",
-							signer[:8],
-						),
-					)
-				}
-
-				stream.Close()
-				return
-			}
-
-			challenge := make([]byte, 32)
-
-			_, err := rand.Read(challenge)
-
-			if err != nil {
-				continue
-			}
-
-			payload := APIPayload{
-				Action:  "dbsc_heartbeat_req",
-				Content: string(challenge),
-			}
-
-			data, err := json.Marshal(payload)
-
-			if err != nil {
-				continue
-			}
-
-			enc, err := csSend.Encrypt(
-				nil,
-				nil,
-				data,
-			)
-
-			if err != nil {
-				continue
-			}
-
-			err = WriteFrame(
-				stream,
-				enc,
-			)
-
-			if err != nil {
-				return
-			}
-
-		case <-stop:
-			return
-		}
-	}
-}
-
-func (g *Gateway) ScrubbingCycle() {
-
-	ticker := time.NewTicker(
-		24 * time.Hour,
-	)
-
-	defer ticker.Stop()
-
-	for range ticker.C {
-
-		if g.router.GUIKit == nil {
-			continue
-		}
-
-		if g.Logger != nil {
-			g.Logger.Info(
-				"Starting global revocation scrub...",
-			)
-		}
-
-		tree := ultimate_db.NewBTree(
-			g.router.GUIKit.BP,
-			2,
-		)
-
-		cursor, err := ultimate_db.NewBTreeCursor(tree)
-
-		if err != nil {
-			continue
-		}
-
-		for {
-
-			key, val, err := cursor.Next()
-
-			if err != nil {
-				break
-			}
-
-			var meta struct {
-				Signer []byte `json:"signer"`
-			}
-
-			if err := json.Unmarshal(
-				val,
-				&meta,
-			); err != nil {
-				continue
-			}
-
-			if len(meta.Signer) > 0 &&
-				!g.isIdentityValid(meta.Signer) {
-
-				txn := g.router.DB.BeginTxn()
-
-				_ = g.router.DB.Write(
-					ContentPageID,
-					txn,
-					key,
-					nil,
-					time.Nanosecond,
-				)
-
-				g.router.DB.CommitTxn(txn)
-
-				if g.Logger != nil {
-
-					g.Logger.Audit(
-						"system_scrubber",
-						"REVOKE_DATA",
-						fmt.Sprintf(
-							"Revoked: %x",
-							meta.Signer[:8],
-						),
-					)
-				}
-			}
-		}
-
-		cursor.Close()
-	}
-}
 
 type APIPayload struct {
 	Action  string `json:"action"`
@@ -518,184 +31,240 @@ type ContentMeta struct {
 	CreatedAt int64  `json:"created_at"`
 }
 
-func (g *Gateway) routeToAPI(
-	signer []byte,
-	payload []byte,
-) {
+type Gateway struct {
+	router         *Router
+	peerMesh       *PeerRoute
+	cipher         noise.CipherSuite
+	sPriv          []byte
+	sPub           []byte
+	Logger         *logger.LogDispatcher
+	activeSessions sync.Map
+}
 
-	var req APIPayload
+func NewGateway(r *Router, peerMesh *PeerRoute, sPriv, sPub []byte, sysLog *logger.LogDispatcher) *Gateway {
+	return &Gateway{
+		router:   r,
+		peerMesh: peerMesh,
+		cipher:   noise.NewCipherSuite(noise.DH25519, noise.CipherAESGCM, noise.HashSHA256),
+		sPriv:    sPriv,
+		sPub:     sPub,
+		Logger:   sysLog,
+	}
+}
 
-	if err := json.Unmarshal(
-		payload,
-		&req,
-	); err != nil {
+func (g *Gateway) SetApplicationHandler(handler http.HandlerFunc) {
+	if g.router != nil {
+		g.router.Mux.Handle("/", handler)
+	}
+}
 
-		if g.Logger != nil {
-
-			g.Logger.Error(
-				fmt.Sprintf(
-					"Invalid API payload from %x: %v",
-					signer[:8],
-					err,
-				),
-			)
+func (g *Gateway) ListenAndServe(port string, tlsConfig *tls.Config) error {
+	if g.router != nil {
+		g.router.Port = port
+		if tlsConfig != nil {
+			g.router.TLSConfig = tlsConfig
 		}
+		g.router.Boot()
+	}
+	return nil
+}
 
+func (g *Gateway) HandleSecureStream(conn *quic.Conn, stream *quic.Stream) {
+	defer stream.Close()
+
+	hs, err := noise.NewHandshakeState(noise.Config{
+		CipherSuite:   g.cipher,
+		Pattern:       noise.HandshakeIK,
+		Initiator:     false,
+		StaticKeypair: noise.DHKey{Private: g.sPriv, Public: g.sPub},
+	})
+	if err != nil {
+		if g.Logger != nil {
+			g.Logger.Error(fmt.Sprintf("Gateway handshake creation failed: %v", err))
+		}
 		return
 	}
 
-	contextData := map[string]string{
-		"target": req.Target,
+	frame, err := ReadFrame(stream, MaxFrameSize)
+	if err != nil {
+		return
 	}
 
-	resource := req.Target
+	_, _, _, err = hs.ReadMessage(nil, frame)
+	if err != nil {
+		return
+	}
 
+	remoteKey := hs.PeerStatic()
+	if !g.isIdentityValid(remoteKey) {
+		if g.Logger != nil {
+			g.Logger.Audit("system_gateway", "TUNNEL_REJECTED", fmt.Sprintf("Revoked context public key: %x", remoteKey[:8]))
+		}
+		return
+	}
+
+	respMsg, csSend, csRecv, err := hs.WriteMessage(nil, nil)
+	if err != nil {
+		return
+	}
+
+	script := fmt.Sprintf(`protocol:handshake(stage("responder") status("established"))`)
+	tx := secure_data_format.DataInvocation{
+		TargetAddress: "protocol:handshake:inbound",
+		Caller:        base64.StdEncoding.EncodeToString(remoteKey),
+		Nonce:         uint64(time.Now().UnixNano()),
+		Method:        "ESTABLISH_TUNNEL",
+		Profile:       secure_data_format.ProfileProofOfPoss,
+	}
+	if _, err := g.router.SdfEngine.CompileSecureData(script, tx); err != nil {
+		if g.Logger != nil {
+			g.Logger.Error(fmt.Sprintf("SDF dataframe validation failed to clear tunnel binding for %x", remoteKey[:8]))
+		}
+		return
+	}
+
+	if err := WriteFrame(stream, respMsg); err != nil {
+		return
+	}
+
+	sessionID := string(remoteKey)
+	g.activeSessions.Store(sessionID, time.Now().Unix())
+
+	stopHeartbeat := make(chan struct{})
+	defer close(stopHeartbeat)
+
+	go g.monitorHeartbeat(stream, csSend, remoteKey, stopHeartbeat)
+
+	if g.Logger != nil {
+		g.Logger.Audit(fmt.Sprintf("%x", remoteKey[:8]), "TUNNEL_ESTABLISHED", "Secure QUIC tunnel verified via dynamic messaging state machine")
+	}
+
+	for {
+		frame, err := ReadFrame(stream, MaxFrameSize)
+		if err != nil {
+			break
+		}
+
+		decrypted, err := csRecv.Decrypt(nil, nil, frame)
+		if err != nil {
+			continue
+		}
+
+		var req APIPayload
+		if err := json.Unmarshal(decrypted, &req); err == nil {
+			if req.Action == "tunnel_bind" {
+				if mod, exists := g.router.Modules["mesh_tunnel"]; exists {
+					tunnelManager, ok := mod.(*TunnelManager)
+					if !ok {
+						continue
+					}
+
+					err := tunnelManager.RegisterTunnel(conn, []byte(req.Content))
+					if err != nil {
+						_ = WriteFrame(stream, []byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
+					}
+					return
+				}
+			}
+		}
+
+		g.routeToAPI(remoteKey, decrypted)
+	}
+
+	g.activeSessions.Delete(sessionID)
+}
+
+func (g *Gateway) isIdentityValid(pubKey []byte) bool {
+	return g.router.PolicyEngine.HasPermission(pubKey, "network:connect")
+}
+
+func (g *Gateway) monitorHeartbeat(stream *quic.Stream, csSend *noise.CipherState, signer []byte, stop <-chan struct{}) {
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			lastSeen, ok := g.activeSessions.Load(string(signer))
+			if !ok || time.Now().Unix()-lastSeen.(int64) > 180 {
+				stream.Close()
+				return
+			}
+
+			challenge := make([]byte, 32)
+			_, _ = rand.Read(challenge)
+
+			payload := APIPayload{Action: "dbsc_heartbeat_req", Content: string(challenge)}
+			data, _ := json.Marshal(payload)
+			enc, _ := csSend.Encrypt(nil, nil, data)
+
+			if err := WriteFrame(stream, enc); err != nil {
+				return
+			}
+		case <-stop:
+			return
+		}
+	}
+}
+
+func (g *Gateway) routeToAPI(signer []byte, payload []byte) {
+	var req APIPayload
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return
+	}
+
+	contextData := map[string]string{"target": req.Target}
+	resource := req.Target
 	if resource == "" {
 		resource = "*"
 	}
 
-	if !g.router.PolicyEngine.Evaluate(
-		signer,
-		req.Action,
-		resource,
-		contextData,
-	) {
-
+	if !g.router.PolicyEngine.Evaluate(signer, req.Action, resource, contextData) {
 		if g.Logger != nil {
-
-			g.Logger.Audit(
-				fmt.Sprintf("%x", signer[:8]),
-				"MESH_DENIED",
-				"Gateway blocked: "+req.Action,
-			)
+			g.Logger.Audit(fmt.Sprintf("%x", signer[:8]), "MESH_DENIED", "Gateway security evaluation block intercepted action: "+req.Action)
 		}
-
 		return
 	}
-
-	txnID := g.router.DB.BeginTxn()
-
-	defer g.router.DB.CommitTxn(txnID)
 
 	now := time.Now().Unix()
 
 	switch req.Action {
-
 	case "dbsc_heartbeat_resp":
-
-		g.activeSessions.Store(
-			string(signer),
-			now,
-		)
+		g.activeSessions.Store(string(signer), now)
 
 	case "post":
+		postID := fmt.Sprintf("post:%d:%x", time.Now().UnixNano(), signer[:4])
+		meta := ContentMeta{Signer: signer, Content: req.Content, CreatedAt: now}
+		val, _ := json.Marshal(meta)
 
-		postID := fmt.Sprintf(
-			"post:%d:%x",
-			time.Now().UnixNano(),
-			signer[:4],
-		)
-
-		meta := ContentMeta{
-			Signer:    signer,
-			Content:   req.Content,
-			CreatedAt: now,
-		}
-
-		val, err := json.Marshal(meta)
-
-		if err != nil {
-			return
-		}
-
-		_ = g.router.DB.Write(
-			ContentPageID,
-			txnID,
-			[]byte(postID),
-			val,
-			0,
-		)
+		txn := g.router.SdfEngine.Store.Begin()
+		_ = g.router.SdfEngine.Store.Put(txn, []byte("data:"+postID), val, 0)
+		_ = txn.Commit()
 
 		if g.Logger != nil {
-
-			g.Logger.Info(
-				fmt.Sprintf(
-					"Mesh Post created by %x: %s",
-					signer[:8],
-					postID,
-				),
-			)
+			g.Logger.Info(fmt.Sprintf("Mesh dynamic content frame provisioned: %s", postID))
 		}
 
 	case "karma":
-
 		if req.Target == "" {
 			return
 		}
+		karmaKey := fmt.Sprintf("karma:%s:%x", req.Target, signer[:8])
+		meta := ContentMeta{Signer: signer, Target: req.Target, Value: req.Value, CreatedAt: now}
+		val, _ := json.Marshal(meta)
 
-		karmaKey := fmt.Sprintf(
-			"karma:%s:%x",
-			req.Target,
-			signer[:8],
-		)
-
-		meta := ContentMeta{
-			Signer:    signer,
-			Target:    req.Target,
-			Value:     req.Value,
-			CreatedAt: now,
-		}
-
-		val, err := json.Marshal(meta)
-
-		if err != nil {
-			return
-		}
-
-		_ = g.router.DB.Write(
-			StatsPageID,
-			txnID,
-			[]byte(karmaKey),
-			val,
-			0,
-		)
-
-		if g.Logger != nil {
-
-			g.Logger.Info(
-				fmt.Sprintf(
-					"Karma (%d) applied to %s by %x",
-					req.Value,
-					req.Target,
-					signer[:8],
-				),
-			)
-		}
+		txn := g.router.SdfEngine.Store.Begin()
+		_ = g.router.SdfEngine.Store.Put(txn, []byte("data:"+karmaKey), val, 0)
+		_ = txn.Commit()
 
 	case "rpc":
-
 		var rpcPayload map[string]interface{}
-
-		if err := json.Unmarshal(
-			[]byte(req.Content),
-			&rpcPayload,
-		); err != nil {
+		if err := json.Unmarshal([]byte(req.Content), &rpcPayload); err != nil {
 			return
 		}
-
 		rpcPayload["signer"] = signer
+		enrichedPayload, _ := json.Marshal(rpcPayload)
 
-		enrichedPayload, err := json.Marshal(
-			rpcPayload,
-		)
-
-		if err != nil {
-			return
-		}
-
-		g.router.LocalBus <- SystemEvent{
-			Topic:   "rpc_ingress",
-			Payload: enrichedPayload,
-		}
+		g.router.LocalBus <- SystemEvent{Topic: "rpc_ingress", Payload: enrichedPayload}
 	}
 }
